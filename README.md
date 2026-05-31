@@ -47,7 +47,7 @@ though the CORS proxy button helps when the target API blocks cross-origin reque
 pkg update && pkg install git python
 
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/sec-proxy.git
+git clone https://github.com/Steven5233/Sec-proxy.git
 cd sec-proxy
 
 # Serve locally
