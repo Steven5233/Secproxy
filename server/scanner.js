@@ -1,245 +1,162 @@
 /* ============================================================
-   scanner.js — Passive security scanner
+   server/scanner.js — Passive security scanner
    Séç Proxy v2.0
-   Runs automatically on every captured request/response pair.
-   Flags issues in the DB and pushes alerts to the UI.
+   Runs on every completed request/response pair.
    ============================================================ */
-
 'use strict';
 
-/* ── Check definitions ───────────────────────────────────── */
 const CHECKS = [
-
-  /* ── Response header checks ── */
+  // ── Response headers ──────────────────────────────────────
   {
-    id:       'missing-hsts',
-    severity: 'medium',
-    type:     'Missing HSTS header',
-    test({ scheme, resHeaders }) {
-      return scheme === 'https' && !resHeaders['strict-transport-security'];
-    },
-    detail: 'Strict-Transport-Security header not present. The site is vulnerable to SSL stripping attacks.',
+    id:'missing-hsts', severity:'medium', type:'Missing HSTS',
+    test({scheme,rH}){ return scheme==='https' && !rH['strict-transport-security']; },
+    detail:'Strict-Transport-Security header absent — vulnerable to SSL stripping.',
   },
   {
-    id:       'missing-csp',
-    severity: 'low',
-    type:     'Missing Content-Security-Policy',
-    test({ resHeaders }) {
-      return !resHeaders['content-security-policy'] &&
-             !resHeaders['x-content-security-policy'];
-    },
-    detail: 'No CSP header found. May be vulnerable to XSS attacks.',
+    id:'missing-csp', severity:'low', type:'Missing Content-Security-Policy',
+    test({rH}){ return !rH['content-security-policy'] && !rH['x-content-security-policy']; },
+    detail:'No CSP header. May be vulnerable to XSS.',
   },
   {
-    id:       'missing-xframe',
-    severity: 'low',
-    type:     'Missing X-Frame-Options',
-    test({ resHeaders }) {
-      return !resHeaders['x-frame-options'] &&
-             !(resHeaders['content-security-policy'] || '').includes('frame-ancestors');
-    },
-    detail: 'No clickjacking protection header present.',
+    id:'missing-xframe', severity:'low', type:'Missing X-Frame-Options',
+    test({rH}){ return !rH['x-frame-options'] && !(rH['content-security-policy']||'').includes('frame-ancestors'); },
+    detail:'No clickjacking protection.',
   },
   {
-    id:       'missing-xcontent',
-    severity: 'info',
-    type:     'Missing X-Content-Type-Options',
-    test({ resHeaders }) {
-      return !resHeaders['x-content-type-options'];
-    },
-    detail: 'Browser may MIME-sniff content, bypassing declared content type.',
+    id:'missing-xcto', severity:'info', type:'Missing X-Content-Type-Options',
+    test({rH}){ return !rH['x-content-type-options']; },
+    detail:'Browser may MIME-sniff responses.',
   },
   {
-    id:       'server-disclosure',
-    severity: 'info',
-    type:     'Server version disclosed',
-    test({ resHeaders }) {
-      const s = resHeaders['server'] || '';
-      return /[0-9]+\.[0-9]+/.test(s);
-    },
-    detail(ctx) {
-      return `Server header reveals version: ${ctx.resHeaders['server']}`;
-    },
+    id:'server-version', severity:'info', type:'Server version disclosed',
+    test({rH}){ return /\d+\.\d+/.test(rH['server']||''); },
+    detail(ctx){ return `Server header: ${ctx.rH['server']}`; },
   },
   {
-    id:       'cors-wildcard',
-    severity: 'medium',
-    type:     'CORS wildcard (Access-Control-Allow-Origin: *)',
-    test({ resHeaders }) {
-      return resHeaders['access-control-allow-origin'] === '*';
-    },
-    detail: 'Wildcard CORS allows any origin to read this response.',
+    id:'cors-wildcard', severity:'medium', type:'CORS wildcard (*)',
+    test({rH}){ return rH['access-control-allow-origin']==='*'; },
+    detail:'Any origin can read this response.',
   },
   {
-    id:       'cors-reflect',
-    severity: 'high',
-    type:     'CORS reflects arbitrary Origin',
-    test({ reqHeaders, resHeaders }) {
-      const origin = reqHeaders['origin'] || '';
-      const acao   = resHeaders['access-control-allow-origin'] || '';
-      const acac   = (resHeaders['access-control-allow-credentials'] || '').toLowerCase();
-      return origin && acao === origin && acac === 'true';
+    id:'cors-reflect', severity:'high', type:'CORS reflects Origin with credentials',
+    test({qH,rH}){
+      const o = qH['origin']||'';
+      return o && rH['access-control-allow-origin']===o &&
+             (rH['access-control-allow-credentials']||'').toLowerCase()==='true';
     },
-    detail: 'Server reflects the Origin header with credentials allowed — potential CORS misconfiguration.',
+    detail:'Server reflects Origin header with credentials=true — CORS misconfiguration.',
   },
-
-  /* ── Cookie checks ── */
+  // ── Cookies ───────────────────────────────────────────────
   {
-    id:       'cookie-no-httponly',
-    severity: 'low',
-    type:     'Cookie missing HttpOnly flag',
-    test({ resHeaders }) {
-      const sc = resHeaders['set-cookie'] || '';
-      if (!sc) return false;
-      const cookies = Array.isArray(sc) ? sc : [sc];
-      return cookies.some(c => !/httponly/i.test(c));
+    id:'cookie-httponly', severity:'low', type:'Cookie missing HttpOnly',
+    test({rH}){
+      const c=rH['set-cookie']; if(!c) return false;
+      return (Array.isArray(c)?c:[c]).some(x=>/httponly/i.test(x)===false);
     },
-    detail: 'One or more cookies are accessible to JavaScript.',
+    detail:'Cookie accessible to JavaScript — XSS can steal it.',
   },
   {
-    id:       'cookie-no-secure',
-    severity: 'low',
-    type:     'Cookie missing Secure flag',
-    test({ scheme, resHeaders }) {
-      if (scheme !== 'https') return false;
-      const sc = resHeaders['set-cookie'] || '';
-      if (!sc) return false;
-      const cookies = Array.isArray(sc) ? sc : [sc];
-      return cookies.some(c => !/;\s*secure/i.test(c));
+    id:'cookie-secure', severity:'low', type:'Cookie missing Secure flag',
+    test({scheme,rH}){
+      if(scheme!=='https') return false;
+      const c=rH['set-cookie']; if(!c) return false;
+      return (Array.isArray(c)?c:[c]).some(x=>/;\s*secure/i.test(x)===false);
     },
-    detail: 'One or more cookies can be sent over unencrypted HTTP.',
+    detail:'Cookie sent over plain HTTP.',
   },
   {
-    id:       'cookie-no-samesite',
-    severity: 'info',
-    type:     'Cookie missing SameSite attribute',
-    test({ resHeaders }) {
-      const sc = resHeaders['set-cookie'] || '';
-      if (!sc) return false;
-      const cookies = Array.isArray(sc) ? sc : [sc];
-      return cookies.some(c => !/samesite/i.test(c));
+    id:'cookie-samesite', severity:'info', type:'Cookie missing SameSite',
+    test({rH}){
+      const c=rH['set-cookie']; if(!c) return false;
+      return (Array.isArray(c)?c:[c]).some(x=>/samesite/i.test(x)===false);
     },
-    detail: 'Cookies without SameSite may be sent in cross-site requests (CSRF risk).',
+    detail:'Cookie vulnerable to CSRF.',
   },
-
-  /* ── Interesting response body / URL checks ── */
+  // ── Response body ─────────────────────────────────────────
   {
-    id:       'reflected-param',
-    severity: 'info',
-    type:     'Query param reflected in response',
-    test({ url, resBody, resContentType }) {
-      if (!resBody || !/html/i.test(resContentType || '')) return false;
+    id:'reflected-param', severity:'info', type:'Query param reflected in HTML',
+    test({url,resBody,ctype}){
+      if(!resBody||!/html/i.test(ctype||'')) return false;
       try {
-        const parsed = new URL(url);
-        for (const [, v] of parsed.searchParams) {
-          if (v.length > 3 && resBody.includes(v)) return true;
-        }
-      } catch (_) {}
+        const p=new URL(url);
+        for(const[,v] of p.searchParams){ if(v.length>3 && resBody.includes(v)) return true; }
+      } catch(_){}
       return false;
     },
-    detail: 'A query parameter value appears unescaped in the HTML response — potential XSS.',
+    detail:'A query param appears unescaped in HTML — potential XSS.',
   },
   {
-    id:       'open-redirect',
-    severity: 'medium',
-    type:     'Possible open redirect',
-    test({ resStatus, resHeaders, url }) {
-      if (![301, 302, 303, 307, 308].includes(resStatus)) return false;
-      const loc = resHeaders['location'] || '';
-      if (!loc) return false;
-      try {
-        const dest = new URL(loc, url);
-        const orig = new URL(url);
-        return dest.hostname !== orig.hostname;
-      } catch (_) { return false; }
+    id:'open-redirect', severity:'medium', type:'Possible open redirect',
+    test({status,rH,url}){
+      if(![301,302,303,307,308].includes(status)) return false;
+      const loc=rH['location']||'';
+      try{ const d=new URL(loc,url),o=new URL(url); return d.hostname!==o.hostname; } catch(_){ return false; }
     },
-    detail(ctx) {
-      return `Redirect to external host: ${ctx.resHeaders['location']}`;
-    },
+    detail(ctx){ return `Redirects to external host: ${ctx.rH['location']}`; },
   },
   {
-    id:       'basic-auth',
-    severity: 'medium',
-    type:     'HTTP Basic Authentication in use',
-    test({ resStatus, resHeaders, scheme }) {
-      return resStatus === 401 &&
-             (resHeaders['www-authenticate'] || '').toLowerCase().startsWith('basic') &&
-             scheme === 'http';
-    },
-    detail: 'Credentials sent as Basic Auth over plain HTTP are trivially sniffable.',
-  },
-  {
-    id:       'jwt-in-url',
-    severity: 'medium',
-    type:     'JWT token in URL',
-    test({ url }) {
-      return /[A-Za-z0-9-_]{20,}\.[A-Za-z0-9-_]{20,}\.[A-Za-z0-9-_]{20,}/.test(url);
-    },
-    detail: 'JWTs in URLs are logged in server access logs and browser history.',
-  },
-  {
-    id:       'stack-trace',
-    severity: 'medium',
-    type:     'Stack trace / debug info in response',
-    test({ resBody }) {
-      if (!resBody) return false;
-      return /at\s+\w+\s*\(.*:\d+:\d+\)|Exception in thread|Traceback \(most recent|SyntaxError:|Fatal error:/
+    id:'stack-trace', severity:'medium', type:'Stack trace in response',
+    test({resBody}){
+      return resBody && /at\s+\w+\s*\(.*:\d+:\d+\)|Traceback \(most recent|Exception in thread|Fatal error:/
         .test(resBody);
     },
-    detail: 'The server returned a stack trace, leaking internal paths and framework details.',
+    detail:'Server leaked internal paths/framework via stack trace.',
   },
   {
-    id:       'private-ip',
-    severity: 'info',
-    type:     'Private IP address in response',
-    test({ resBody }) {
-      if (!resBody) return false;
-      return /\b(10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)\b/
+    id:'private-ip', severity:'info', type:'Private IP in response',
+    test({resBody}){
+      return resBody && /\b(10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)\b/
         .test(resBody);
     },
-    detail: 'A private RFC1918 IP address appears in the response body — possible SSRF target or network mapping.',
+    detail:'RFC1918 IP found — possible SSRF target.',
+  },
+  {
+    id:'jwt-in-url', severity:'medium', type:'JWT in URL',
+    test({url}){ return /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/.test(url); },
+    detail:'JWTs in URLs appear in logs and browser history.',
+  },
+  {
+    id:'basic-auth-plain', severity:'high', type:'Basic Auth over HTTP',
+    test({scheme,status,rH}){
+      return scheme==='http' && status===401 &&
+             (rH['www-authenticate']||'').toLowerCase().startsWith('basic');
+    },
+    detail:'Credentials transmitted in plaintext.',
   },
 ];
 
-/* ── Run all checks against a completed request entry ──── */
-function scan(entry) {
-  const ctx = {
-    scheme:         entry.scheme || 'http',
-    url:            entry.url    || '',
-    resStatus:      entry.res_status,
-    resBody:        entry.res_body || '',
-    resContentType: '',
-    reqHeaders:     {},
-    resHeaders:     {},
-  };
-
-  try { ctx.reqHeaders = JSON.parse(entry.req_headers || '{}'); } catch (_) {}
-  try { ctx.resHeaders = JSON.parse(entry.res_headers || '{}'); } catch (_) {}
-
-  // Normalise header names to lowercase
-  ctx.reqHeaders = toLower(ctx.reqHeaders);
-  ctx.resHeaders = toLower(ctx.resHeaders);
-  ctx.resContentType = ctx.resHeaders['content-type'] || '';
-
-  const hits = [];
-  for (const check of CHECKS) {
-    try {
-      if (check.test(ctx)) {
-        hits.push({
-          severity: check.severity,
-          type:     check.type,
-          detail:   typeof check.detail === 'function' ? check.detail(ctx) : check.detail,
-        });
-      }
-    } catch (_) {}
-  }
-  return hits;
+// lowercase all header keys
+function toLower(obj) {
+  const out={};
+  for (const k of Object.keys(obj||{})) out[k.toLowerCase()]=obj[k];
+  return out;
 }
 
-function toLower(obj) {
-  const out = {};
-  for (const k of Object.keys(obj)) out[k.toLowerCase()] = obj[k];
-  return out;
+function scan(entry) {
+  let qH={}, rH={};
+  try { qH=toLower(JSON.parse(entry.req_headers||'{}')); } catch(_){}
+  try { rH=toLower(JSON.parse(entry.res_headers||'{}')); } catch(_){}
+
+  const ctx = {
+    scheme:  entry.scheme||'http',
+    url:     entry.url||'',
+    status:  entry.res_status,
+    resBody: entry.res_body||'',
+    ctype:   rH['content-type']||'',
+    qH, rH,
+  };
+
+  const hits=[];
+  for (const c of CHECKS) {
+    try {
+      if (c.test(ctx)) hits.push({
+        severity: c.severity,
+        type:     c.type,
+        detail:   typeof c.detail==='function' ? c.detail(ctx) : c.detail,
+      });
+    } catch(_){}
+  }
+  return hits;
 }
 
 module.exports = { scan };
