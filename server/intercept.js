@@ -1,12 +1,7 @@
 /* ============================================================
-   intercept.js — Intercept engine
+   server/intercept.js — Intercept engine (singleton)
    Séç Proxy v2.0
-
-   Manages the paused-request queue. When intercept mode is ON
-   every matching request is held here until the UI calls
-   forward() or drop().
    ============================================================ */
-
 'use strict';
 
 const EventEmitter = require('events');
@@ -15,29 +10,24 @@ const db           = require('./db');
 class InterceptEngine extends EventEmitter {
   constructor() {
     super();
-    this.enabled  = false;   // global intercept on/off
-    this.queue    = new Map(); // id → { req, resolve, reject, ts }
-    this._counter = 0;
+    this.enabled = false;
+    this.queue   = new Map();  // id → { request, resolve, reject, ts }
+    this._seq    = 0;
   }
 
-  /* ── Toggle intercept on/off ─────────────────────────── */
   setEnabled(v) {
     this.enabled = !!v;
     this.emit('status', { enabled: this.enabled });
   }
 
-  /* ── Match-rule evaluation ───────────────────────────── */
-  _matchesRules(requestObj) {
+  // ── Match rules against a request object ──────────────────
+  _matches(req) {
     const rules = db.listRules().filter(r => r.enabled);
-    if (!rules.length) return true; // no rules = intercept everything
-
-    return rules.every(rule => {
-      const haystack = this._fieldValue(rule.field, requestObj);
-      return this._evaluate(rule.op, haystack, rule.value);
-    });
+    if (!rules.length) return true;               // no rules = match all
+    return rules.every(r => this._eval(r, req));
   }
 
-  _fieldValue(field, req) {
+  _fieldVal(field, req) {
     switch (field) {
       case 'host':   return req.host   || '';
       case 'url':    return req.url    || '';
@@ -47,120 +37,95 @@ class InterceptEngine extends EventEmitter {
     }
   }
 
-  _evaluate(op, haystack, needle) {
-    switch (op) {
-      case 'contains': return haystack.includes(needle);
-      case 'equals':   return haystack === needle;
-      case 'starts':   return haystack.startsWith(needle);
-      case 'matches': {
-        try { return new RegExp(needle).test(haystack); } catch (_) { return false; }
-      }
-      default: return true;
+  _eval(rule, req) {
+    const hay = this._fieldVal(rule.field, req);
+    switch (rule.op) {
+      case 'contains': return hay.includes(rule.value);
+      case 'equals':   return hay === rule.value;
+      case 'starts':   return hay.startsWith(rule.value);
+      case 'matches':  try { return new RegExp(rule.value).test(hay); } catch (_) { return false; }
+      default:         return true;
     }
   }
 
-  /* ── Apply match-and-replace rules ──────────────────── */
-  applyMatchReplace(requestObj, scope) {
-    const rules = db.listMRRules().filter(r => r.enabled &&
-      (r.scope === scope || r.scope === 'both'));
-
+  // ── Apply match-replace rules ─────────────────────────────
+  applyMR(reqOrRes, scope) {
+    const rules = db.listMR().filter(r => r.enabled && (r.scope === scope || r.scope === 'both'));
+    let obj = { ...reqOrRes };
     for (const rule of rules) {
-      try {
-        requestObj = this._applyRule(requestObj, rule);
-      } catch (_) {}
+      try { obj = this._applyMR(obj, rule); } catch (_) {}
     }
-    return requestObj;
+    return obj;
   }
 
-  _applyRule(req, rule) {
-    const replace = (str) => {
+  _applyMR(obj, rule) {
+    const rep = (str) => {
       if (!str) return str;
-      if (rule.use_regex) {
-        return str.replace(new RegExp(rule.match, 'g'), rule.replace);
-      }
-      return str.split(rule.match).join(rule.replace);
+      return rule.use_regex
+        ? str.replace(new RegExp(rule.match_str, 'g'), rule.replace)
+        : str.split(rule.match_str).join(rule.replace);
     };
-
     switch (rule.field) {
-      case 'url':
-        req = { ...req, url: replace(req.url), path: replace(req.path) };
-        break;
-      case 'body':
-        req = { ...req, body: replace(req.body) };
-        break;
+      case 'url':          return { ...obj, url: rep(obj.url), path: rep(obj.path) };
+      case 'body':         return { ...obj, body: rep(obj.body) };
       case 'header-value': {
-        const headers = { ...req.headers };
-        for (const k of Object.keys(headers)) {
-          headers[k] = replace(String(headers[k]));
-        }
-        req = { ...req, headers };
-        break;
+        const h = {};
+        for (const [k,v] of Object.entries(obj.headers||{})) h[k] = rep(String(v));
+        return { ...obj, headers: h };
       }
       case 'header-name': {
-        const headers = {};
-        for (const k of Object.keys(req.headers || {})) {
-          const newKey = replace(k);
-          headers[newKey] = req.headers[k];
-        }
-        req = { ...req, headers };
-        break;
+        const h = {};
+        for (const [k,v] of Object.entries(obj.headers||{})) h[rep(k)] = v;
+        return { ...obj, headers: h };
       }
+      default: return obj;
     }
-    return req;
   }
 
-  /* ── Pause a request until forwarded/dropped ─────────── */
-  pause(requestObj) {
-    if (!this.enabled || !this._matchesRules(requestObj)) {
-      return Promise.resolve({ action: 'forward', request: requestObj });
+  // ── Pause until forwarded/dropped ─────────────────────────
+  pause(reqObj) {
+    if (!this.enabled || !this._matches(reqObj)) {
+      return Promise.resolve({ action:'forward', request:reqObj });
     }
-
-    const id = ++this._counter;
-    return new Promise((resolve, reject) => {
-      this.queue.set(id, { request: requestObj, resolve, reject, ts: Date.now() });
-      this.emit('paused', { id, request: requestObj });
+    const id = ++this._seq;
+    return new Promise((resolve) => {
+      this.queue.set(id, { request:reqObj, resolve, ts:Date.now() });
+      this.emit('paused', { id, request:reqObj });
     });
   }
 
-  /* ── Forward (optionally with modifications) ─────────── */
-  forward(id, modifiedRequest) {
-    const entry = this.queue.get(id);
-    if (!entry) return false;
+  forward(id, modified) {
+    const e = this.queue.get(id);
+    if (!e) return false;
     this.queue.delete(id);
-    entry.resolve({ action: 'forward', request: modifiedRequest || entry.request });
+    e.resolve({ action:'forward', request: modified || e.request });
     this.emit('forwarded', { id });
     return true;
   }
 
-  /* ── Drop ────────────────────────────────────────────── */
   drop(id) {
-    const entry = this.queue.get(id);
-    if (!entry) return false;
+    const e = this.queue.get(id);
+    if (!e) return false;
     this.queue.delete(id);
-    entry.resolve({ action: 'drop' });
+    e.resolve({ action:'drop' });
     this.emit('dropped', { id });
     return true;
   }
 
-  /* ── Forward all pending ─────────────────────────────── */
   forwardAll() {
-    for (const [id, entry] of this.queue) {
-      entry.resolve({ action: 'forward', request: entry.request });
+    for (const [id, e] of this.queue) {
+      e.resolve({ action:'forward', request:e.request });
       this.emit('forwarded', { id });
     }
     this.queue.clear();
   }
 
-  /* ── List pending ────────────────────────────────────── */
   listPending() {
     return [...this.queue.entries()].map(([id, e]) => ({
-      id,
-      ts:      e.ts,
-      method:  e.request.method,
-      url:     e.request.url,
-      host:    e.request.host,
+      id, ts:e.ts, method:e.request.method,
+      url:e.request.url, host:e.request.host,
     }));
   }
 }
 
-module.exports = new InterceptEngine(); // singleton
+module.exports = new InterceptEngine();
