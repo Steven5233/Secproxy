@@ -1,23 +1,19 @@
 /* ============================================================
-   proxy.js — Main proxy server
+   server/proxy.js — Main proxy server + REST API
    Séç Proxy v2.0
 
-   Starts two servers:
-     :8080  — HTTP proxy listener (forward proxy)
-     :8081  — WebSocket bridge   (handled by ws-bridge.js)
-     :8080/api/* — REST API for the UI (piggy-backed on same port)
-
-   Browser/device → proxy → internet
+   Ports:
+     PROXY_PORT (default 8080) — HTTP forward proxy + REST API
+     WS_PORT    (default 8081) — WebSocket bridge to UI
    ============================================================ */
-
 'use strict';
 
 const http      = require('http');
-const net       = require('net');
+const https     = require('https');
 const url       = require('url');
 const zlib      = require('zlib');
 const fs        = require('fs');
-const path      = require('path');
+const os        = require('os');
 
 const db        = require('./db');
 const bridge    = require('./ws-bridge');
@@ -29,409 +25,308 @@ const ca        = require('./ca');
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
 const WS_PORT    = parseInt(process.env.WS_PORT    || '8081', 10);
 
-/* ── Stats counters ──────────────────────────────────────── */
-let stats = {
-  total: 0, intercepted: 0, errors: 0,
-  bytesIn: 0, bytesOut: 0,
-  startedAt: Date.now(),
-};
+const stats = { total:0, intercepted:0, errors:0, bytesIn:0, bytesOut:0, startedAt:Date.now() };
 
-/* ── Decompress response body if gzip/deflate ───────────── */
-function decompress(buffer, encoding) {
-  return new Promise((resolve) => {
-    if (!encoding) return resolve(buffer);
-    const enc = encoding.toLowerCase();
-    if (enc.includes('gzip')) {
-      zlib.gunzip(buffer, (e, r) => resolve(e ? buffer : r));
-    } else if (enc.includes('deflate')) {
-      zlib.inflate(buffer, (e, r) => resolve(e ? buffer : r));
-    } else if (enc.includes('br')) {
-      zlib.brotliDecompress(buffer, (e, r) => resolve(e ? buffer : r));
-    } else {
-      resolve(buffer);
-    }
+// ── Helpers ──────────────────────────────────────────────────
+function decompress(buf, enc) {
+  return new Promise(res => {
+    if (!enc) return res(buf);
+    const e = enc.toLowerCase();
+    if (e.includes('gzip'))    zlib.gunzip(buf, (er,r) => res(er?buf:r));
+    else if (e.includes('deflate')) zlib.inflate(buf, (er,r) => res(er?buf:r));
+    else if (e.includes('br')) zlib.brotliDecompress(buf, (er,r) => res(er?buf:r));
+    else res(buf);
   });
 }
 
-/* ── Collect request body ────────────────────────────────── */
-function collectBody(incoming) {
-  return new Promise((resolve) => {
-    const chunks = [];
-    incoming.on('data', c => chunks.push(c));
-    incoming.on('end',  () => resolve(Buffer.concat(chunks)));
-    incoming.on('error',() => resolve(Buffer.alloc(0)));
+function collectBody(req) {
+  return new Promise(res => {
+    const c=[];
+    req.on('data', d => c.push(d));
+    req.on('end',  () => res(Buffer.concat(c)));
+    req.on('error',() => res(Buffer.alloc(0)));
   });
 }
 
-/* ── Forward a plain HTTP request ────────────────────────── */
+function getLanIP() {
+  const nets = os.networkInterfaces();
+  for (const ifaces of Object.values(nets))
+    for (const i of ifaces)
+      if (i.family==='IPv4' && !i.internal) return i.address;
+  return '127.0.0.1';
+}
+
+function corsHeaders() {
+  return {
+    'Content-Type':                'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers':'*',
+    'Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,OPTIONS',
+  };
+}
+
+function sendJSON(res, data, status=200) {
+  res.writeHead(status, corsHeaders());
+  res.end(JSON.stringify(data));
+}
+
+// ── Forward a plain HTTP request to origin ───────────────────
 function forwardHTTP(reqObj, clientRes) {
-  return new Promise((resolve) => {
-    const parsed = url.parse(reqObj.url);
-    const options = {
+  return new Promise(resolve => {
+    const parsed  = url.parse(reqObj.url);
+    const isHTTPS = parsed.protocol === 'https:';
+    const lib     = isHTTPS ? https : http;
+    const opts = {
       hostname: parsed.hostname,
-      port:     parsed.port || 80,
+      port:     parsed.port || (isHTTPS?443:80),
       path:     parsed.path || '/',
       method:   reqObj.method,
       headers:  { ...reqObj.headers },
+      rejectUnauthorized: false,
     };
-
-    // Remove proxy-specific headers
-    delete options.headers['proxy-connection'];
-    delete options.headers['proxy-authorization'];
+    delete opts.headers['proxy-connection'];
+    delete opts.headers['proxy-authorization'];
 
     const t0  = Date.now();
-    const req = http.request(options, async (res) => {
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', async () => {
-        const rawBody  = Buffer.concat(chunks);
-        const encoding = res.headers['content-encoding'];
-        const bodyBuf  = await decompress(rawBody, encoding);
-        const bodyStr  = bodyBuf.toString('utf8');
+    const req = lib.request(opts, async (originRes) => {
+      const chunks=[];
+      originRes.on('data', c => chunks.push(c));
+      originRes.on('end',  async () => {
+        const raw   = Buffer.concat(chunks);
+        const buf   = await decompress(raw, originRes.headers['content-encoding']);
+        const body  = buf.toString('utf8');
+        const rh    = {};
+        for (const [k,v] of Object.entries(originRes.headers)) rh[k]=v;
+        delete rh['content-encoding'];
+        rh['content-length'] = String(buf.length);
 
-        const resHeaders = {};
-        for (const [k, v] of Object.entries(res.headers)) resHeaders[k] = v;
+        // stream to client
+        try { clientRes.writeHead(originRes.statusCode, rh); clientRes.end(buf); } catch(_){}
 
-        // Remove content-encoding since we've already decoded
-        delete resHeaders['content-encoding'];
-        resHeaders['content-length'] = String(bodyBuf.length);
-
-        // Forward to client
-        clientRes.writeHead(res.statusCode, resHeaders);
-        clientRes.end(bodyBuf);
-
-        resolve({
-          status:     res.statusCode,
-          headers:    resHeaders,
-          body:       bodyStr,
-          latency_ms: Date.now() - t0,
-        });
+        resolve({ status:originRes.statusCode, headers:rh, body, latency_ms:Date.now()-t0 });
       });
     });
-
-    req.on('error', (e) => {
-      try {
-        clientRes.writeHead(502);
-        clientRes.end(`Séç Proxy: upstream error — ${e.message}`);
-      } catch (_) {}
-      resolve({ status: 502, headers: {}, body: e.message, latency_ms: Date.now() - t0 });
+    req.on('error', e => {
+      try { clientRes.writeHead(502); clientRes.end(`Séç Proxy upstream error: ${e.message}`); } catch(_){}
+      resolve({ status:502, headers:{}, body:e.message, latency_ms:Date.now()-t0 });
     });
-
     if (reqObj.body) req.write(reqObj.body);
     req.end();
   });
 }
 
-/* ── REST API handler (served on same port as proxy) ─────── */
-async function handleAPI(pathname, method, body, res) {
-  const send = (data, status = 200) => {
-    const json = JSON.stringify(data);
-    res.writeHead(status, {
-      'Content-Type':                'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers':'*',
-      'Access-Control-Allow-Methods':'*',
-    });
-    res.end(json);
-  };
+// ── REST API ─────────────────────────────────────────────────
+async function handleAPI(pathname, method, bodyStr, res) {
+  // CORS preflight
+  if (method==='OPTIONS') { res.writeHead(204, corsHeaders()); res.end(); return; }
 
-  let parsed = {};
-  try { parsed = JSON.parse(body || '{}'); } catch (_) {}
+  let body={};
+  try { body = JSON.parse(bodyStr||'{}'); } catch(_){}
 
-  /* ── Requests ── */
-  if (pathname === '/api/requests' && method === 'GET') {
-    return send(db.list(500));
+  // ── Requests ──
+  if (method==='GET'  && pathname==='/api/requests') return sendJSON(res, db.list(1000));
+  if (method==='GET'  && /^\/api\/requests\/\d+$/.test(pathname)) {
+    const id=parseInt(pathname.split('/')[3]);
+    const r=db.getById(id);
+    if (!r) return sendJSON(res,{error:'not found'},404);
+    return sendJSON(res, { ...r, scanner_hits:db.hitsFor(id) });
   }
-  if (pathname.startsWith('/api/requests/') && method === 'GET') {
-    const id = parseInt(pathname.split('/')[3]);
-    const r  = db.getById(id);
-    if (!r) return send({ error: 'not found' }, 404);
-    const hits = db.getHitsForRequest(id);
-    return send({ ...r, scanner_hits: hits });
-  }
-  if (pathname === '/api/requests/search' && method === 'GET') {
-    return send({ error: 'use POST' }, 400);
-  }
-  if (pathname === '/api/search' && method === 'POST') {
-    return send(db.search(parsed.q || ''));
-  }
-  if (pathname === '/api/requests/clear' && method === 'POST') {
-    db.clearAll();
-    return send({ ok: true });
-  }
+  if (method==='POST' && pathname==='/api/requests/clear') { db.clearAll(); return sendJSON(res,{ok:true}); }
+  if (method==='POST' && pathname==='/api/search')         return sendJSON(res, db.search(body.q||''));
 
-  /* ── Repeater ── */
-  if (pathname === '/api/repeat' && method === 'POST') {
-    const { method: m, url: u, headers, body: b } = parsed;
-    if (!u) return send({ error: 'url required' }, 400);
-    const t0 = Date.now();
-    const result = await new Promise((resolve) => {
-      const pUrl = url.parse(u);
-      const isHTTPS = pUrl.protocol === 'https:';
+  // ── Repeater ──
+  if (method==='POST' && pathname==='/api/repeat') {
+    const { method:m, url:u, headers:h={}, body:b } = body;
+    if (!u) return sendJSON(res,{error:'url required'},400);
+    const t0=Date.now();
+    const pUrl=url.parse(u);
+    const isHTTPS=pUrl.protocol==='https:';
+    const lib=isHTTPS?https:http;
+    const result = await new Promise(resolve => {
       const opts = {
-        hostname: pUrl.hostname,
-        port:     pUrl.port || (isHTTPS ? 443 : 80),
-        path:     pUrl.path || '/',
-        method:   m || 'GET',
-        headers:  headers || {},
+        hostname:pUrl.hostname, port:pUrl.port||(isHTTPS?443:80),
+        path:pUrl.path||'/', method:m||'GET', headers:h, rejectUnauthorized:false,
       };
-      const lib = isHTTPS ? require('https') : http;
-      const req = lib.request(opts, async (r) => {
-        const chunks = [];
-        r.on('data', c => chunks.push(c));
-        r.on('end', async () => {
-          const raw = Buffer.concat(chunks);
-          const dec = await decompress(raw, r.headers['content-encoding']);
-          const rh  = {};
-          for (const [k, v] of Object.entries(r.headers)) rh[k] = v;
-          resolve({
-            status: r.statusCode, headers: rh,
-            body: dec.toString('utf8'), latency: Date.now() - t0,
-          });
+      const req=lib.request(opts, async r => {
+        const chunks=[];
+        r.on('data',c=>chunks.push(c));
+        r.on('end', async()=>{
+          const raw=Buffer.concat(chunks);
+          const buf=await decompress(raw,r.headers['content-encoding']);
+          const rh={};
+          for(const[k,v] of Object.entries(r.headers)) rh[k]=v;
+          resolve({ status:r.statusCode, headers:rh, body:buf.toString('utf8'), latency:Date.now()-t0 });
         });
       });
-      req.on('error', e => resolve({ status: 0, headers: {}, body: e.message, latency: Date.now() - t0 }));
+      req.on('error', e=>resolve({status:0,headers:{},body:e.message,latency:Date.now()-t0}));
       if (b) req.write(b);
       req.end();
     });
-    return send(result);
+    return sendJSON(res, result);
   }
 
-  /* ── Intercept control ── */
-  if (pathname === '/api/intercept/status' && method === 'GET') {
-    return send({ enabled: intercept.enabled, pending: intercept.listPending() });
-  }
-  if (pathname === '/api/intercept/toggle' && method === 'POST') {
+  // ── Intercept ──
+  if (method==='GET'  && pathname==='/api/intercept/status') return sendJSON(res,{ enabled:intercept.enabled, pending:intercept.listPending() });
+  if (method==='POST' && pathname==='/api/intercept/toggle') {
     intercept.setEnabled(!intercept.enabled);
-    bridge.emitStatus({ intercept: intercept.enabled });
-    return send({ enabled: intercept.enabled });
+    bridge.emitStatus({ intercept:intercept.enabled });
+    return sendJSON(res,{ enabled:intercept.enabled });
   }
-  if (pathname === '/api/intercept/forward' && method === 'POST') {
-    const ok = intercept.forward(parsed.id, parsed.request);
-    return send({ ok });
+  if (method==='POST' && pathname==='/api/intercept/forward') {
+    return sendJSON(res,{ ok:intercept.forward(body.id, body.request) });
   }
-  if (pathname === '/api/intercept/drop' && method === 'POST') {
-    const ok = intercept.drop(parsed.id);
-    return send({ ok });
+  if (method==='POST' && pathname==='/api/intercept/drop') {
+    return sendJSON(res,{ ok:intercept.drop(body.id) });
   }
-  if (pathname === '/api/intercept/forward-all' && method === 'POST') {
-    intercept.forwardAll();
-    return send({ ok: true });
+  if (method==='POST' && pathname==='/api/intercept/forward-all') {
+    intercept.forwardAll(); return sendJSON(res,{ok:true});
   }
 
-  /* ── Rules ── */
-  if (pathname === '/api/rules' && method === 'GET') {
-    return send(db.listRules());
-  }
-  if (pathname === '/api/rules' && method === 'POST') {
-    db.addRule(parsed);
-    return send({ ok: true });
-  }
-  if (pathname.startsWith('/api/rules/') && method === 'DELETE') {
-    db.deleteRule(parseInt(pathname.split('/')[3]));
-    return send({ ok: true });
-  }
+  // ── Intercept rules ──
+  if (method==='GET'  && pathname==='/api/rules')                              return sendJSON(res,db.listRules());
+  if (method==='POST' && pathname==='/api/rules')                              { db.addRule(body); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/rules\/\d+$/.test(pathname))              { db.deleteRule(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
 
-  /* ── Match-Replace rules ── */
-  if (pathname === '/api/mr-rules' && method === 'GET') {
-    return send(db.listMRRules());
-  }
-  if (pathname === '/api/mr-rules' && method === 'POST') {
-    db.addMRRule(parsed);
-    return send({ ok: true });
-  }
-  if (pathname.startsWith('/api/mr-rules/') && method === 'DELETE') {
-    db.deleteMRRule(parseInt(pathname.split('/')[3]));
-    return send({ ok: true });
-  }
+  // ── Match-replace rules ──
+  if (method==='GET'  && pathname==='/api/mr-rules')                          return sendJSON(res,db.listMR());
+  if (method==='POST' && pathname==='/api/mr-rules')                          { db.addMR(body); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))          { db.deleteMR(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
 
-  /* ── Saved requests ── */
-  if (pathname === '/api/saved' && method === 'GET') {
-    return send(db.listSaved());
-  }
-  if (pathname === '/api/saved' && method === 'POST') {
-    db.saveRequest(parsed);
-    return send({ ok: true });
-  }
-  if (pathname.startsWith('/api/saved/') && method === 'DELETE') {
-    db.deleteSaved(parseInt(pathname.split('/')[3]));
-    return send({ ok: true });
-  }
+  // ── Saved requests ──
+  if (method==='GET'  && pathname==='/api/saved')                             return sendJSON(res,db.listSaved());
+  if (method==='POST' && pathname==='/api/saved')                             { db.saveRequest(body); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/saved\/\d+$/.test(pathname))             { db.deleteSaved(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
 
-  /* ── Stats ── */
-  if (pathname === '/api/stats' && method === 'GET') {
-    return send({ ...stats, uptime: Date.now() - stats.startedAt });
-  }
+  // ── Stats ──
+  if (method==='GET' && pathname==='/api/stats') return sendJSON(res,{ ...stats, uptime:Date.now()-stats.startedAt });
 
-  /* ── CA cert download ── */
-  if (pathname === '/api/ca.crt' && method === 'GET') {
+  // ── CA cert download ──
+  if (method==='GET' && pathname==='/api/ca.crt') {
     try {
-      const certBuf = fs.readFileSync(ca.caCertDerPath);
-      res.writeHead(200, {
-        'Content-Type':        'application/x-x509-ca-cert',
-        'Content-Disposition': 'attachment; filename="secproxy-ca.crt"',
-        'Content-Length':      certBuf.length,
-      });
-      return res.end(certBuf);
-    } catch (_) {
-      return send({ error: 'CA cert not found' }, 404);
-    }
+      const buf=fs.readFileSync(ca.caCertDerPath);
+      res.writeHead(200,{ 'Content-Type':'application/x-x509-ca-cert', 'Content-Disposition':'attachment; filename="secproxy-ca.crt"', 'Content-Length':buf.length });
+      return res.end(buf);
+    } catch(_) { return sendJSON(res,{error:'CA cert not found'},404); }
   }
 
-  /* ── QR proxy info ── */
-  if (pathname === '/api/info' && method === 'GET') {
-    const { networkInterfaces } = require('os');
-    const nets = networkInterfaces();
-    const ips  = [];
-    for (const ifaces of Object.values(nets)) {
-      for (const iface of ifaces) {
-        if (iface.family === 'IPv4' && !iface.internal) ips.push(iface.address);
-      }
-    }
-    return send({ proxyHost: ips[0] || '127.0.0.1', proxyPort: PROXY_PORT, wsPort: WS_PORT });
+  // ── Proxy info ──
+  if (method==='GET' && pathname==='/api/info') {
+    return sendJSON(res,{ proxyHost:getLanIP(), proxyPort:PROXY_PORT, wsPort:WS_PORT });
   }
 
-  send({ error: 'not found' }, 404);
+  sendJSON(res,{error:'not found'},404);
 }
 
-/* ── Main HTTP server ────────────────────────────────────── */
+// ── Main server ──────────────────────────────────────────────
 const server = http.createServer(async (clientReq, clientRes) => {
   const reqUrl = clientReq.url || '/';
 
-  /* ── CORS preflight ── */
-  if (clientReq.method === 'OPTIONS') {
-    clientRes.writeHead(204, {
-      'Access-Control-Allow-Origin':  '*',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Methods': '*',
-    });
-    return clientRes.end();
+  // CORS preflight to API
+  if (clientReq.method==='OPTIONS') {
+    clientRes.writeHead(204, corsHeaders()); clientRes.end(); return;
   }
 
-  /* ── API requests from UI ── */
+  // API requests from UI
   if (reqUrl.startsWith('/api/')) {
-    const body = (await collectBody(clientReq)).toString('utf8');
-    return handleAPI(reqUrl.split('?')[0], clientReq.method, body, clientRes);
+    const bodyStr = (await collectBody(clientReq)).toString('utf8');
+    return handleAPI(reqUrl.split('?')[0], clientReq.method, bodyStr, clientRes);
   }
 
-  /* ── Proxy request ── */
+  // ── Proxy request ────────────────────────────────────────
   stats.total++;
-
-  const parsedUrl = url.parse(reqUrl);
-  const host  = parsedUrl.hostname || (clientReq.headers['host'] || '').split(':')[0];
-  const port  = parsedUrl.port || 80;
-  const scheme = 'http';
-
-  const bodyBuf = await collectBody(clientReq);
-  const bodyStr = bodyBuf.length ? bodyBuf.toString('utf8') : '';
-
-  const headers = {};
-  for (const [k, v] of Object.entries(clientReq.headers)) headers[k] = v;
+  const parsed = url.parse(reqUrl);
+  const host   = parsed.hostname || (clientReq.headers['host']||'').split(':')[0];
+  const port   = parseInt(parsed.port||80);
+  const bodyBuf= await collectBody(clientReq);
+  const bodyStr= bodyBuf.length ? bodyBuf.toString('utf8') : '';
+  const headers= {};
+  for (const [k,v] of Object.entries(clientReq.headers)) headers[k]=v;
 
   let reqObj = {
-    method:  clientReq.method,
-    scheme,
-    host,
-    port:    parseInt(port),
-    path:    parsedUrl.path || '/',
-    url:     reqUrl.startsWith('http') ? reqUrl : `http://${host}${parsedUrl.path || '/'}`,
-    headers,
-    body:    bodyStr,
+    method: clientReq.method, scheme:'http', host, port,
+    path: parsed.path||'/',
+    url: reqUrl.startsWith('http') ? reqUrl : `http://${host}${parsed.path||'/'}`,
+    headers, body:bodyStr,
   };
 
-  /* Apply request match-replace */
-  reqObj = intercept.applyMatchReplace(reqObj, 'request');
+  // Match-replace on request
+  reqObj = intercept.applyMR(reqObj, 'request');
 
-  /* Pause for intercept if enabled */
+  // Intercept pause
   let finalReq = reqObj;
   try {
-    const result = await intercept.pause(reqObj);
-    if (result.action === 'drop') {
+    const r = await intercept.pause(reqObj);
+    if (r.action==='drop') {
       stats.intercepted++;
-      clientRes.writeHead(200);
-      clientRes.end('Request dropped by Séç Proxy intercept.');
+      clientRes.writeHead(200); clientRes.end('Dropped by Séç Proxy.');
       return;
     }
-    finalReq = result.request;
+    finalReq = r.request;
     if (intercept.enabled) stats.intercepted++;
-  } catch (_) {}
+  } catch(_){}
 
-  /* Store request */
+  // Store request
   const reqId = db.insertRequest(finalReq);
-  bridge.emitRequest({
-    id: reqId, ...finalReq,
-    req_headers: finalReq.headers,
-    req_body:    finalReq.body,
-  });
+  bridge.emitRequest({ id:reqId, ...finalReq, req_headers:finalReq.headers, req_body:finalReq.body });
 
-  /* Forward to origin */
+  // Forward
   const resObj = await forwardHTTP(finalReq, clientRes);
 
-  /* Apply response match-replace */
-  const modRes = intercept.applyMatchReplace(resObj, 'response');
+  // Match-replace on response
+  const modRes = intercept.applyMR(resObj, 'response');
 
-  /* Store response */
+  // Store response
   db.updateResponse(reqId, modRes);
-  stats.bytesOut += (finalReq.body || '').length;
-  stats.bytesIn  += (modRes.body   || '').length;
+  stats.bytesOut += (finalReq.body||'').length;
+  stats.bytesIn  += (modRes.body||'').length;
 
-  /* Passive scan */
-  const fullEntry = db.getById(reqId);
-  const hits = scanner.scan(fullEntry);
+  // Passive scan
+  const full = db.getById(reqId);
+  const hits = scanner.scan(full);
   if (hits.length) {
-    hits.forEach(h => db.addScannerHit({ request_id: reqId, ...h }));
+    hits.forEach(h => db.addHit({ request_id:reqId, ...h }));
     bridge.emitScannerHit(reqId, hits);
   }
 
-  bridge.emitResponse({ id: reqId, ...modRes });
+  bridge.emitResponse({ id:reqId, res_status:modRes.status, res_headers:modRes.headers, res_body:modRes.body, latency_ms:modRes.latency_ms });
   bridge.emitStats(stats);
 });
 
-/* ── CONNECT handler for HTTPS MITM ─────────────────────── */
-server.on('connect', (req, clientSocket, head) => {
-  const [hostname, portStr] = (req.url || '').split(':');
-  const port = parseInt(portStr || '443', 10);
+// ── HTTPS CONNECT → MITM ─────────────────────────────────────
+server.on('connect', (req, socket, head) => {
   stats.total++;
-
-  mitm.handleConnect(clientSocket, hostname, port, head);
+  const [hostname, portStr='443'] = (req.url||'').split(':');
+  mitm.handleConnect(socket, hostname, parseInt(portStr));
 });
 
-/* ── Intercept events → WS bridge ───────────────────────── */
-intercept.on('paused',    ({ id, request }) => {
-  stats.intercepted++;
-  bridge.emitIntercepted(id, request);
-});
-intercept.on('forwarded', ({ id }) => bridge.emitInterceptResolved(id, 'forward'));
-intercept.on('dropped',   ({ id }) => bridge.emitInterceptResolved(id, 'drop'));
+// ── Wire intercept events → WS ───────────────────────────────
+intercept.on('paused',    ({id,request}) => { stats.intercepted++; bridge.emitIntercepted(id,request); });
+intercept.on('forwarded', ({id})         => bridge.emitInterceptDone(id,'forward'));
+intercept.on('dropped',   ({id})         => bridge.emitInterceptDone(id,'drop'));
 
-/* ── Start ───────────────────────────────────────────────── */
+// ── Start ─────────────────────────────────────────────────────
 server.listen(PROXY_PORT, '0.0.0.0', () => {
+  bridge.start(WS_PORT);
+  const lanIP = getLanIP();
   console.log('');
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║          Séç Proxy v2.0 — RUNNING           ║');
   console.log('╠══════════════════════════════════════════════╣');
-  console.log(`║  HTTP Proxy  →  0.0.0.0:${PROXY_PORT}                ║`);
-  console.log(`║  WS Bridge   →  ws://0.0.0.0:${WS_PORT}            ║`);
-  console.log(`║  UI API      →  http://127.0.0.1:${PROXY_PORT}/api   ║`);
+  console.log(`║  Proxy   →  0.0.0.0:${PROXY_PORT}  (${lanIP})   ║`);
+  console.log(`║  WS      →  ws://0.0.0.0:${WS_PORT}              ║`);
+  console.log(`║  API     →  http://127.0.0.1:${PROXY_PORT}/api    ║`);
   console.log('╠══════════════════════════════════════════════╣');
-  console.log('║  Set browser proxy:  127.0.0.1:8080         ║');
-  console.log('║  Install CA cert:    /api/ca.crt             ║');
+  console.log('║  Browser proxy: 127.0.0.1:8080              ║');
+  console.log('║  Wi-Fi proxy:   ' + lanIP + ':8080' + '              ║'.slice(0));
+  console.log('║  CA cert:       GET /api/ca.crt              ║');
   console.log('╚══════════════════════════════════════════════╝');
   console.log('');
-  bridge.start(WS_PORT);
 });
 
-server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
-    console.error(`[Proxy] Port ${PROXY_PORT} is in use. Try: PROXY_PORT=8082 node server/proxy.js`);
-  } else {
-    console.error('[Proxy] Server error:', e.message);
-  }
+server.on('error', e => {
+  if (e.code==='EADDRINUSE') console.error(`[Proxy] Port ${PROXY_PORT} in use. Try: PROXY_PORT=8082 node server/proxy.js`);
+  else console.error('[Proxy]', e.message);
   process.exit(1);
 });
 
-process.on('SIGINT', () => {
-  console.log('\n[Proxy] Shutting down...');
-  db.close();
-  process.exit(0);
-});
+process.on('SIGINT', () => { console.log('\n[Proxy] Shutting down.'); db.close(); process.exit(0); });
