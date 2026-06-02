@@ -1,19 +1,19 @@
 {
   "name": "sec-proxy",
   "version": "2.0.0",
-  "description": "Séç Proxy v2.0 — Burp Suite-style intercepting HTTP/HTTPS proxy with built-in browser, for Termux/Android & Desktop",
+  "description": "Séç Proxy v2.0 — Burp Suite-style intercepting HTTP/HTTPS proxy for Termux/Android & Desktop",
   "main": "browser/main.js",
   "scripts": {
-    "start":       "electron .",
-    "start:proxy": "node server/proxy.js",
-    "start:ui":    "python3 -m http.server 3000 --directory ui",
-    "start:nogui": "node server/proxy.js & python3 -m http.server 3000 --directory ui",
-    "termux":      "bash start.sh"
+    "start":        "electron .",
+    "start:proxy":  "node server/proxy.js",
+    "start:ui":     "node server/ui-server.js",
+    "start:nogui":  "node server/proxy.js & node server/ui-server.js",
+    "termux":       "bash start.sh"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
-    "node-forge":     "^1.3.1",
-    "ws":             "^8.16.0"
+    "sql.js":     "^1.11.0",
+    "node-forge": "^1.3.1",
+    "ws":         "^8.16.0"
   },
   "devDependencies": {
     "electron": "^29.0.0"
