@@ -53,47 +53,21 @@ function startProxyServer() {
 // ── Serve the static UI from ui/ folder ──────────────────────
 function startUIServer() {
   return new Promise((resolve) => {
-    const fs   = require('fs');
-    const mime = {
-      '.html': 'text/html',
-      '.css':  'text/css',
-      '.js':   'application/javascript',
-      '.json': 'application/json',
-      '.png':  'image/png',
-      '.ico':  'image/x-icon',
-      '.svg':  'image/svg+xml',
-    };
-    const uiRoot = path.join(__dirname, '..', 'ui');
-
-    uiServer = http.createServer((req, res) => {
-      let filePath = path.join(uiRoot, req.url === '/' ? 'index.html' : req.url);
-      filePath = filePath.split('?')[0];
-      const ext = path.extname(filePath);
-      fs.readFile(filePath, (err, data) => {
-        if (err) {
-          // forward /api/* to the proxy server
-          if (req.url.startsWith('/api/')) {
-            const opts = { hostname:'127.0.0.1', port:PROXY_PORT, path:req.url, method:req.method, headers:req.headers };
-            const proxyReq = http.request(opts, proxyRes => {
-              res.writeHead(proxyRes.statusCode, proxyRes.headers);
-              proxyRes.pipe(res);
-            });
-            proxyReq.on('error', () => { res.writeHead(502); res.end('Proxy API error'); });
-            req.pipe(proxyReq);
-            return;
-          }
-          res.writeHead(404); res.end('Not found');
-          return;
-        }
-        res.writeHead(200, { 'Content-Type': mime[ext] || 'text/plain' });
-        res.end(data);
-      });
+    // Fork the shared ui-server.js (same server used in Termux mode)
+    // It correctly serves static files AND proxies /api/* to the proxy port.
+    const uiServerPath = path.join(__dirname, '..', 'server', 'ui-server.js');
+    uiServer = fork(uiServerPath, [], {
+      env: { ...process.env, UI_PORT, PROXY_PORT },
+      stdio: 'pipe',
     });
-
-    uiServer.listen(UI_PORT, '127.0.0.1', () => {
-      console.log(`[UI] Serving on http://127.0.0.1:${UI_PORT}`);
-      resolve();
+    uiServer.stdout.on('data', (d) => {
+      const line = d.toString();
+      process.stdout.write('[ui] ' + line);
+      if (line.includes('Serving ui/')) resolve();
     });
+    uiServer.stderr.on('data', (d) => process.stderr.write('[ui-err] ' + d));
+    // Fallback resolve after 3s
+    setTimeout(resolve, 3000);
   });
 }
 
@@ -217,7 +191,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (proxyProc) proxyProc.kill();
-  if (uiServer)  uiServer.close();
+  if (uiServer)  uiServer.kill();   // now a child process, not http.Server
   app.quit();
 });
 
