@@ -1,136 +1,206 @@
 /* ============================================================
    server/db.js — SQLite persistence layer
    Séç Proxy v2.0
+
+   Uses sql.js (pure JavaScript SQLite — no native compilation,
+   works perfectly on Termux without node-gyp).
+
+   Data is saved to secproxy.db on every write via fs.writeFile.
    ============================================================ */
 'use strict';
 
-const path     = require('path');
-const Database = require('better-sqlite3');
+const path = require('path');
+const fs   = require('fs');
 
 const DB_PATH = path.join(__dirname, '..', 'secproxy.db');
-const db      = new Database(DB_PATH);
 
-// ── Schema ──────────────────────────────────────────────────
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA synchronous  = NORMAL;
+// ── Load sql.js ──────────────────────────────────────────────
+const initSqlJs = require('sql.js');
 
-  CREATE TABLE IF NOT EXISTS requests (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          INTEGER NOT NULL,
-    method      TEXT    NOT NULL,
-    scheme      TEXT    NOT NULL DEFAULT 'http',
-    host        TEXT    NOT NULL,
-    port        INTEGER NOT NULL DEFAULT 80,
-    path        TEXT    NOT NULL DEFAULT '/',
-    url         TEXT    NOT NULL,
-    req_headers TEXT    NOT NULL DEFAULT '{}',
-    req_body    TEXT,
-    res_status  INTEGER,
-    res_headers TEXT,
-    res_body    TEXT,
-    latency_ms  INTEGER,
-    flagged     INTEGER NOT NULL DEFAULT 0,
-    notes       TEXT,
-    tag         TEXT
-  );
+let db  = null;   // sql.js Database instance
+let ready = false;
 
-  CREATE TABLE IF NOT EXISTS scanner_hits (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
-    ts         INTEGER NOT NULL,
-    severity   TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    detail     TEXT
-  );
+// Write DB to disk (called after every mutating operation)
+function persist() {
+  try {
+    const data = db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (e) {
+    console.error('[DB] persist error:', e.message);
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS saved_requests (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         INTEGER NOT NULL,
-    name       TEXT NOT NULL,
-    folder     TEXT NOT NULL DEFAULT 'Default',
-    request_id INTEGER REFERENCES requests(id),
-    raw        TEXT NOT NULL
-  );
+// ── Bootstrap ────────────────────────────────────────────────
+async function init() {
+  const SQL = await initSqlJs();
 
-  CREATE TABLE IF NOT EXISTS intercept_rules (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    field   TEXT NOT NULL,
-    op      TEXT NOT NULL,
-    value   TEXT NOT NULL
-  );
+  if (fs.existsSync(DB_PATH)) {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+  } else {
+    db = new SQL.Database();
+  }
 
-  CREATE TABLE IF NOT EXISTS match_replace_rules (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    enabled   INTEGER NOT NULL DEFAULT 1,
-    scope     TEXT NOT NULL,
-    field     TEXT NOT NULL,
-    match_str TEXT NOT NULL,
-    replace   TEXT NOT NULL,
-    use_regex INTEGER NOT NULL DEFAULT 0
-  );
+  db.run(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts          INTEGER NOT NULL,
+      method      TEXT    NOT NULL,
+      scheme      TEXT    NOT NULL DEFAULT 'http',
+      host        TEXT    NOT NULL,
+      port        INTEGER NOT NULL DEFAULT 80,
+      path        TEXT    NOT NULL DEFAULT '/',
+      url         TEXT    NOT NULL,
+      req_headers TEXT    NOT NULL DEFAULT '{}',
+      req_body    TEXT,
+      res_status  INTEGER,
+      res_headers TEXT,
+      res_body    TEXT,
+      latency_ms  INTEGER,
+      flagged     INTEGER NOT NULL DEFAULT 0,
+      notes       TEXT,
+      tag         TEXT
+    );
+    CREATE TABLE IF NOT EXISTS scanner_hits (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id INTEGER NOT NULL,
+      ts         INTEGER NOT NULL,
+      severity   TEXT NOT NULL,
+      type       TEXT NOT NULL,
+      detail     TEXT
+    );
+    CREATE TABLE IF NOT EXISTS saved_requests (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts         INTEGER NOT NULL,
+      name       TEXT NOT NULL,
+      folder     TEXT NOT NULL DEFAULT 'Default',
+      request_id INTEGER,
+      raw        TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS intercept_rules (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      field   TEXT NOT NULL,
+      op      TEXT NOT NULL,
+      value   TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS match_replace_rules (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      enabled   INTEGER NOT NULL DEFAULT 1,
+      scope     TEXT NOT NULL,
+      field     TEXT NOT NULL,
+      match_str TEXT NOT NULL,
+      replace   TEXT NOT NULL,
+      use_regex INTEGER NOT NULL DEFAULT 0
+    );
+  `);
 
-  CREATE INDEX IF NOT EXISTS idx_req_ts   ON requests(ts);
-  CREATE INDEX IF NOT EXISTS idx_req_host ON requests(host);
-  CREATE INDEX IF NOT EXISTS idx_req_flag ON requests(flagged);
-`);
+  persist();
+  ready = true;
+  console.log('[DB] sql.js database ready —', DB_PATH);
+}
 
-// ── Prepared statements ──────────────────────────────────────
-const S = {
-  insertReq: db.prepare(`
-    INSERT INTO requests (ts,method,scheme,host,port,path,url,req_headers,req_body)
-    VALUES (@ts,@method,@scheme,@host,@port,@path,@url,@req_headers,@req_body)
-  `),
-  updateRes: db.prepare(`
-    UPDATE requests SET res_status=@res_status,res_headers=@res_headers,
-    res_body=@res_body,latency_ms=@latency_ms WHERE id=@id
-  `),
-  getById:    db.prepare(`SELECT * FROM requests WHERE id=?`),
-  list:       db.prepare(`SELECT id,ts,method,scheme,host,port,path,url,req_headers,req_body,res_status,res_headers,res_body,latency_ms,flagged,tag FROM requests ORDER BY ts DESC LIMIT ?`),
-  search:     db.prepare(`SELECT id,ts,method,scheme,host,port,path,url,res_status,latency_ms,flagged,tag FROM requests WHERE host LIKE ? OR url LIKE ? OR CAST(res_status AS TEXT) LIKE ? ORDER BY ts DESC LIMIT 500`),
-  clearAll:   db.prepare(`DELETE FROM requests`),
-  flagReq:    db.prepare(`UPDATE requests SET flagged=1 WHERE id=?`),
-  insertHit:  db.prepare(`INSERT INTO scanner_hits(request_id,ts,severity,type,detail) VALUES(@request_id,@ts,@severity,@type,@detail)`),
-  hitsForReq: db.prepare(`SELECT * FROM scanner_hits WHERE request_id=?`),
-  saveReq:    db.prepare(`INSERT INTO saved_requests(ts,name,folder,request_id,raw) VALUES(@ts,@name,@folder,@request_id,@raw)`),
-  listSaved:  db.prepare(`SELECT * FROM saved_requests ORDER BY folder,name`),
-  delSaved:   db.prepare(`DELETE FROM saved_requests WHERE id=?`),
-  listRules:  db.prepare(`SELECT * FROM intercept_rules ORDER BY id`),
-  addRule:    db.prepare(`INSERT INTO intercept_rules(enabled,field,op,value) VALUES(@enabled,@field,@op,@value)`),
-  delRule:    db.prepare(`DELETE FROM intercept_rules WHERE id=?`),
-  listMR:     db.prepare(`SELECT * FROM match_replace_rules ORDER BY id`),
-  addMR:      db.prepare(`INSERT INTO match_replace_rules(enabled,scope,field,match_str,replace,use_regex) VALUES(@enabled,@scope,@field,@match_str,@replace,@use_regex)`),
-  delMR:      db.prepare(`DELETE FROM match_replace_rules WHERE id=?`),
-};
+// ── Helper: run a single query and persist ───────────────────
+function run(sql, params = []) {
+  db.run(sql, params);
+  persist();
+}
 
-// ── API ──────────────────────────────────────────────────────
+// ── Helper: return all rows as array of plain objects ─────────
+function all(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+
+// ── Helper: return first row ─────────────────────────────────
+function get(sql, params = []) {
+  const rows = all(sql, params);
+  return rows[0] || null;
+}
+
+// ── Helper: insert and return last insert id ──────────────────
+function insert(sql, params = []) {
+  db.run(sql, params);
+  const row = get('SELECT last_insert_rowid() AS id');
+  persist();
+  return row ? row.id : null;
+}
+
+// ── Public API ────────────────────────────────────────────────
 module.exports = {
+  init,
+  get ready() { return ready; },
+
   insertRequest(r) {
-    return S.insertReq.run({
-      ts: Date.now(), method: r.method||'GET', scheme: r.scheme||'http',
-      host: r.host||'', port: r.port||80, path: r.path||'/',
-      url: r.url||'', req_headers: JSON.stringify(r.headers||{}), req_body: r.body||null,
-    }).lastInsertRowid;
+    return insert(
+      `INSERT INTO requests (ts,method,scheme,host,port,path,url,req_headers,req_body)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [Date.now(), r.method||'GET', r.scheme||'http', r.host||'',
+       r.port||80, r.path||'/', r.url||'',
+       JSON.stringify(r.headers||{}), r.body||null]
+    );
   },
+
   updateResponse(id, r) {
-    S.updateRes.run({ id, res_status: r.status||null, res_headers: JSON.stringify(r.headers||{}), res_body: r.body||null, latency_ms: r.latency_ms||null });
+    run(
+      `UPDATE requests SET res_status=?,res_headers=?,res_body=?,latency_ms=? WHERE id=?`,
+      [r.status||null, JSON.stringify(r.headers||{}), r.body||null, r.latency_ms||null, id]
+    );
   },
-  getById(id)       { return S.getById.get(id); },
-  list(n=500)       { return S.list.all(n); },
-  search(q)         { const w=`%${q}%`; return S.search.all(w,w,w); },
-  clearAll()        { S.clearAll.run(); },
-  flagRequest(id)   { S.flagReq.run(id); },
-  addHit(h)         { S.insertHit.run({ request_id:h.request_id, ts:Date.now(), severity:h.severity, type:h.type, detail:h.detail||'' }); this.flagRequest(h.request_id); },
-  hitsFor(id)       { return S.hitsForReq.all(id); },
-  saveRequest(o)    { return S.saveReq.run({ ts:Date.now(), ...o }); },
-  listSaved()       { return S.listSaved.all(); },
-  deleteSaved(id)   { S.delSaved.run(id); },
-  listRules()       { return S.listRules.all(); },
-  addRule(r)        { return S.addRule.run(r); },
-  deleteRule(id)    { S.delRule.run(id); },
-  listMR()          { return S.listMR.all(); },
-  addMR(r)          { return S.addMR.run(r); },
-  deleteMR(id)      { S.delMR.run(id); },
-  close()           { db.close(); },
+
+  getById(id) { return get(`SELECT * FROM requests WHERE id=?`, [id]); },
+
+  list(n = 1000) {
+    return all(
+      `SELECT id,ts,method,scheme,host,port,path,url,req_headers,req_body,
+              res_status,res_headers,res_body,latency_ms,flagged,tag
+       FROM requests ORDER BY ts DESC LIMIT ?`, [n]
+    );
+  },
+
+  search(q) {
+    const w = `%${q}%`;
+    return all(
+      `SELECT id,ts,method,scheme,host,port,path,url,res_status,latency_ms,flagged,tag
+       FROM requests WHERE host LIKE ? OR url LIKE ? OR CAST(res_status AS TEXT) LIKE ?
+       ORDER BY ts DESC LIMIT 500`, [w, w, w]
+    );
+  },
+
+  clearAll()      { run(`DELETE FROM requests`); run(`DELETE FROM scanner_hits`); },
+  flagRequest(id) { run(`UPDATE requests SET flagged=1 WHERE id=?`, [id]); },
+
+  addHit(h) {
+    insert(
+      `INSERT INTO scanner_hits(request_id,ts,severity,type,detail) VALUES(?,?,?,?,?)`,
+      [h.request_id, Date.now(), h.severity, h.type, h.detail||'']
+    );
+    this.flagRequest(h.request_id);
+  },
+
+  hitsFor(id)   { return all(`SELECT * FROM scanner_hits WHERE request_id=?`, [id]); },
+
+  saveRequest(o) {
+    return insert(
+      `INSERT INTO saved_requests(ts,name,folder,request_id,raw) VALUES(?,?,?,?,?)`,
+      [Date.now(), o.name, o.folder||'Default', o.request_id||null, o.raw||'']
+    );
+  },
+
+  listSaved()       { return all(`SELECT * FROM saved_requests ORDER BY folder,name`); },
+  deleteSaved(id)   { run(`DELETE FROM saved_requests WHERE id=?`, [id]); },
+
+  listRules()       { return all(`SELECT * FROM intercept_rules ORDER BY id`); },
+  addRule(r)        { return insert(`INSERT INTO intercept_rules(enabled,field,op,value) VALUES(?,?,?,?)`, [r.enabled||1, r.field, r.op, r.value]); },
+  deleteRule(id)    { run(`DELETE FROM intercept_rules WHERE id=?`, [id]); },
+
+  listMR()          { return all(`SELECT * FROM match_replace_rules ORDER BY id`); },
+  addMR(r)          { return insert(`INSERT INTO match_replace_rules(enabled,scope,field,match_str,replace,use_regex) VALUES(?,?,?,?,?,?)`, [r.enabled||1, r.scope, r.field, r.match_str, r.replace, r.use_regex||0]); },
+  deleteMR(id)      { run(`DELETE FROM match_replace_rules WHERE id=?`, [id]); },
+
+  close()           { if (db) { persist(); db.close(); } },
 };
