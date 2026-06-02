@@ -10,7 +10,6 @@
 
 const http      = require('http');
 const https     = require('https');
-const url       = require('url');
 const zlib      = require('zlib');
 const fs        = require('fs');
 const os        = require('os');
@@ -73,13 +72,13 @@ function sendJSON(res, data, status=200) {
 // ── Forward a plain HTTP request to origin ───────────────────
 function forwardHTTP(reqObj, clientRes) {
   return new Promise(resolve => {
-    const parsed  = url.parse(reqObj.url);
+    const parsed  = new URL(reqObj.url);
     const isHTTPS = parsed.protocol === 'https:';
     const lib     = isHTTPS ? https : http;
     const opts = {
       hostname: parsed.hostname,
       port:     parsed.port || (isHTTPS?443:80),
-      path:     parsed.path || '/',
+      path:     (parsed.pathname || '/') + (parsed.search || ''),
       method:   reqObj.method,
       headers:  { ...reqObj.headers },
       rejectUnauthorized: false,
@@ -139,13 +138,16 @@ async function handleAPI(pathname, method, bodyStr, res) {
     const { method:m, url:u, headers:h={}, body:b } = body;
     if (!u) return sendJSON(res,{error:'url required'},400);
     const t0=Date.now();
-    const pUrl=url.parse(u);
+    let pUrl;
+    try { pUrl = new URL(u); } catch(_) { pUrl = new URL('https://'+u); }
     const isHTTPS=pUrl.protocol==='https:';
     const lib=isHTTPS?https:http;
     const result = await new Promise(resolve => {
       const opts = {
-        hostname:pUrl.hostname, port:pUrl.port||(isHTTPS?443:80),
-        path:pUrl.path||'/', method:m||'GET', headers:h, rejectUnauthorized:false,
+        hostname:pUrl.hostname,
+        port:pUrl.port||(isHTTPS?443:80),
+        path:(pUrl.pathname||'/')+(pUrl.search||''),
+        method:m||'GET', headers:h, rejectUnauthorized:false,
       };
       const req=lib.request(opts, async r => {
         const chunks=[];
@@ -234,7 +236,9 @@ const server = http.createServer(async (clientReq, clientRes) => {
 
   // ── Proxy request ────────────────────────────────────────
   stats.total++;
-  const parsed = url.parse(reqUrl);
+  const fullReqUrl = reqUrl.startsWith('http') ? reqUrl : `http://${clientReq.headers['host']||'localhost'}${reqUrl}`;
+  let parsed;
+  try { parsed = new URL(fullReqUrl); } catch(_) { parsed = new URL('http://localhost' + reqUrl); }
   const host   = parsed.hostname || (clientReq.headers['host']||'').split(':')[0];
   const port   = parseInt(parsed.port||80);
   const bodyBuf= await collectBody(clientReq);
@@ -244,8 +248,8 @@ const server = http.createServer(async (clientReq, clientRes) => {
 
   let reqObj = {
     method: clientReq.method, scheme:'http', host, port,
-    path: parsed.path||'/',
-    url: reqUrl.startsWith('http') ? reqUrl : `http://${host}${parsed.path||'/'}`,
+    path: (parsed.pathname||'/') + (parsed.search||''),
+    url: fullReqUrl,
     headers, body:bodyStr,
   };
 
@@ -304,23 +308,27 @@ intercept.on('paused',    ({id,request}) => { stats.intercepted++; bridge.emitIn
 intercept.on('forwarded', ({id})         => bridge.emitInterceptDone(id,'forward'));
 intercept.on('dropped',   ({id})         => bridge.emitInterceptDone(id,'drop'));
 
-// ── Start ─────────────────────────────────────────────────────
-server.listen(PROXY_PORT, '0.0.0.0', () => {
-  bridge.start(WS_PORT);
-  const lanIP = getLanIP();
-  console.log('');
-  console.log('╔══════════════════════════════════════════════╗');
-  console.log('║          Séç Proxy v2.0 — RUNNING           ║');
-  console.log('╠══════════════════════════════════════════════╣');
-  console.log(`║  Proxy   →  0.0.0.0:${PROXY_PORT}  (${lanIP})   ║`);
-  console.log(`║  WS      →  ws://0.0.0.0:${WS_PORT}              ║`);
-  console.log(`║  API     →  http://127.0.0.1:${PROXY_PORT}/api    ║`);
-  console.log('╠══════════════════════════════════════════════╣');
-  console.log('║  Browser proxy: 127.0.0.1:8080              ║');
-  console.log('║  Wi-Fi proxy:   ' + lanIP + ':8080' + '              ║'.slice(0));
-  console.log('║  CA cert:       GET /api/ca.crt              ║');
-  console.log('╚══════════════════════════════════════════════╝');
-  console.log('');
+// ── Start — wait for DB then listen ───────────────────────────
+db.init().then(() => {
+  server.listen(PROXY_PORT, '0.0.0.0', () => {
+    bridge.start(WS_PORT);
+    const lanIP = getLanIP();
+    console.log('');
+    console.log('╔══════════════════════════════════════════════╗');
+    console.log('║          Séç Proxy v2.0 — RUNNING           ║');
+    console.log('╠══════════════════════════════════════════════╣');
+    console.log(`║  Proxy   →  0.0.0.0:${PROXY_PORT}  (${lanIP})`);
+    console.log(`║  WS      →  ws://0.0.0.0:${WS_PORT}`);
+    console.log(`║  API     →  http://127.0.0.1:${PROXY_PORT}/api`);
+    console.log('╠══════════════════════════════════════════════╣');
+    console.log('║  Browser proxy: 127.0.0.1:8080              ║');
+    console.log('║  CA cert:       GET /api/ca.crt              ║');
+    console.log('╚══════════════════════════════════════════════╝');
+    console.log('');
+  });
+}).catch(e => {
+  console.error('[Proxy] DB init failed:', e.message);
+  process.exit(1);
 });
 
 server.on('error', e => {
