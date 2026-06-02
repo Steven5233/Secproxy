@@ -9,10 +9,10 @@ WS_PORT=${WS_PORT:-8081}
 UI_PORT=${UI_PORT:-3000}
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# Keep screen alive
+# Keep screen alive while proxy runs
 termux-wake-lock 2>/dev/null
 
-# Get LAN IP (so you can set Wi-Fi proxy from another device)
+# Get LAN IP for Wi-Fi proxy setup on other devices
 IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1);exit}}}')
 IP=${IP:-127.0.0.1}
 
@@ -21,51 +21,112 @@ echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║         Séç Proxy v2.0 — Termux Mode            ║"
 echo "╠══════════════════════════════════════════════════╣"
-echo "║  HTTP Proxy  →  $IP:$PROXY_PORT                    ║"
-echo "║  Proxy UI    →  http://127.0.0.1:$UI_PORT          ║"
+echo "║  HTTP Proxy  →  $IP:$PROXY_PORT"
+echo "║  Proxy UI    →  http://127.0.0.1:$UI_PORT"
 echo "╠══════════════════════════════════════════════════╣"
-echo "║  Browser proxy setup:                            ║"
-echo "║  Firefox → Settings → Network → Manual Proxy    ║"
-echo "║  HTTP: 127.0.0.1   Port: $PROXY_PORT               ║"
-echo "║  Check: Also use for HTTPS                       ║"
+echo "║  Firefox proxy setup:                            ║"
+echo "║  Settings → Network → Manual Proxy              ║"
+echo "║  HTTP: 127.0.0.1   Port: $PROXY_PORT"
+echo "║  ☑ Also use for HTTPS                            ║"
 echo "╠══════════════════════════════════════════════════╣"
-echo "║  HTTPS (install CA cert):                        ║"
-echo "║  Open http://127.0.0.1:$UI_PORT after start       ║"
-echo "║  Go to Settings tab → Download CA Cert          ║"
-echo "║  Install via Android Settings → Security         ║"
+echo "║  Download CA cert (fixes HTTPS):                 ║"
+echo "║  http://127.0.0.1:$UI_PORT/api/ca.crt"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
 cd "$ROOT"
 
-# Install deps if needed
+# ── Install npm deps on first run ────────────────────────────
 if [ ! -d node_modules ]; then
-  echo "[*] Installing npm dependencies..."
-  npm install --omit=dev
+  echo "[*] Installing npm dependencies (first run — takes ~2 min)..."
+  npm install --omit=dev 2>&1
+  if [ $? -ne 0 ]; then
+    echo "[!] npm install failed. Trying with legacy peer deps..."
+    npm install --omit=dev --legacy-peer-deps 2>&1
+  fi
   echo ""
 fi
 
-# Start proxy server
-PROXY_PORT=$PROXY_PORT WS_PORT=$WS_PORT node server/proxy.js &
+# ── Check Node is available ───────────────────────────────────
+if ! command -v node &>/dev/null; then
+  echo "[!] Node.js not found. Install it: pkg install nodejs"
+  exit 1
+fi
+
+# ── Start proxy server ────────────────────────────────────────
+echo "[*] Starting proxy server on port $PROXY_PORT..."
+PROXY_PORT=$PROXY_PORT WS_PORT=$WS_PORT node server/proxy.js > /tmp/secproxy.log 2>&1 &
 PROXY_PID=$!
 echo "[+] Proxy server started (PID $PROXY_PID)"
 
-sleep 1
+# Wait for proxy to be ready (up to 8 seconds)
+echo "[*] Waiting for proxy server to be ready..."
+for i in $(seq 1 16); do
+  sleep 0.5
+  if node -e "
+    const http = require('http');
+    http.get('http://127.0.0.1:$PROXY_PORT/api/stats', r => {
+      process.exit(0);
+    }).on('error', () => process.exit(1));
+  " 2>/dev/null; then
+    echo "[+] Proxy server is ready."
+    break
+  fi
+  if [ $i -eq 16 ]; then
+    echo "[!] Proxy server took too long. Check /tmp/secproxy.log"
+    echo "    Last log lines:"
+    tail -5 /tmp/secproxy.log 2>/dev/null
+  fi
+done
 
-# Start UI server (serves ui/ folder)
-python3 -m http.server $UI_PORT --directory ui --bind 127.0.0.1 &
+# ── Start UI server (Node — proxies /api/* correctly) ─────────
+echo "[*] Starting UI server on port $UI_PORT..."
+PROXY_PORT=$PROXY_PORT UI_PORT=$UI_PORT node server/ui-server.js > /tmp/secproxy-ui.log 2>&1 &
 UI_PID=$!
-echo "[+] UI server started  (PID $UI_PID)"
 
-sleep 0.5
+sleep 0.8
+
+# Confirm UI server is up
+if kill -0 $UI_PID 2>/dev/null; then
+  echo "[+] UI server started (PID $UI_PID)"
+else
+  echo "[!] UI server failed to start. Check /tmp/secproxy-ui.log"
+  cat /tmp/secproxy-ui.log 2>/dev/null
+fi
 
 echo ""
-echo "[*] Opening http://127.0.0.1:$UI_PORT in browser..."
-termux-open-url "http://127.0.0.1:$UI_PORT" 2>/dev/null || \
-  xdg-open "http://127.0.0.1:$UI_PORT" 2>/dev/null || \
-  echo "    Open http://127.0.0.1:$UI_PORT manually in your browser"
-
+echo "┌─────────────────────────────────────────────────┐"
+echo "│  All services running. Opening UI...            │"
+echo "│                                                 │"
+echo "│  Proxy UI   → http://127.0.0.1:$UI_PORT          │"
+echo "│  CA Cert    → http://127.0.0.1:$UI_PORT/api/ca.crt│"
+echo "│  Proxy      → 127.0.0.1:$PROXY_PORT               │"
+echo "└─────────────────────────────────────────────────┘"
 echo ""
-echo "[*] Press Ctrl+C to stop."
-trap "echo ''; echo 'Stopping...'; kill $PROXY_PID $UI_PID 2>/dev/null; termux-wake-unlock 2>/dev/null; exit 0" INT TERM
-wait
+
+# ── Open browser ──────────────────────────────────────────────
+termux-open-url "http://127.0.0.1:$UI_PORT" 2>/dev/null \
+  || xdg-open   "http://127.0.0.1:$UI_PORT" 2>/dev/null \
+  || echo "    Open http://127.0.0.1:$UI_PORT in your browser"
+
+echo "[*] Press Ctrl+C to stop all services."
+echo ""
+
+# ── Cleanup on exit ───────────────────────────────────────────
+cleanup() {
+  echo ""
+  echo "[*] Shutting down Séç Proxy..."
+  kill $PROXY_PID $UI_PID 2>/dev/null
+  wait $PROXY_PID $UI_PID 2>/dev/null
+  termux-wake-unlock 2>/dev/null
+  echo "[+] Stopped. Goodbye."
+  exit 0
+}
+trap cleanup INT TERM
+
+# Keep script alive; tail logs to terminal
+tail -f /tmp/secproxy.log /tmp/secproxy-ui.log 2>/dev/null &
+TAIL_PID=$!
+trap "cleanup; kill $TAIL_PID 2>/dev/null" INT TERM
+
+wait $PROXY_PID
