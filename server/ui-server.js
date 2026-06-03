@@ -13,7 +13,7 @@
      node server/ui-server.js
    Env:
      UI_PORT    (default 3000)
-     PROXY_PORT (default 8080)
+     API_PORT (default 8080)
    ============================================================ */
 
 'use strict';
@@ -21,10 +21,9 @@
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
-const url  = require('url');
 
-const UI_PORT    = parseInt(process.env.UI_PORT    || '3000', 10);
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
+const UI_PORT  = parseInt(process.env.UI_PORT  || '3000', 10);
+const API_PORT = parseInt(process.env.API_PORT || '8888', 10); // API is separate from proxy port
 const UI_ROOT    = path.join(__dirname, '..', 'ui');
 
 // ── MIME types ───────────────────────────────────────────────
@@ -52,12 +51,12 @@ const FAVICON = Buffer.from(
 function forwardToProxy(clientReq, clientRes, reqBody) {
   const options = {
     hostname: '127.0.0.1',
-    port:     PROXY_PORT,
+    port:     API_PORT,
     path:     clientReq.url,
     method:   clientReq.method,
     headers:  {
       ...clientReq.headers,
-      host: `127.0.0.1:${PROXY_PORT}`,
+      host: `127.0.0.1:${API_PORT}`,
     },
   };
 
@@ -85,7 +84,7 @@ function forwardToProxy(clientReq, clientRes, reqBody) {
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({
       error: 'Could not reach proxy server',
-      detail: `Make sure the proxy is running on port ${PROXY_PORT}`,
+      detail: `Make sure the proxy is running on port ${API_PORT}`,
       message: err.message,
     }));
   });
@@ -127,7 +126,7 @@ function collectBody(req) {
 
 // ── Main server ───────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const parsedUrl  = url.parse(req.url);
+  const parsedUrl  = new URL(req.url, `http://127.0.0.1:${UI_PORT}`);
   const pathname   = parsedUrl.pathname;
 
   // ── CORS preflight ──────────────────────────────────────────
@@ -187,7 +186,7 @@ server.on('error', (e) => {
 
 server.listen(UI_PORT, '127.0.0.1', () => {
   console.log(`[UI-Server] Serving ui/ on http://127.0.0.1:${UI_PORT}`);
-  console.log(`[UI-Server] Forwarding /api/* → http://127.0.0.1:${PROXY_PORT}`);
+  console.log(`[UI-Server] Forwarding /api/* → http://127.0.0.1:${API_PORT}`);
   console.log(`[UI-Server] CA cert available at http://127.0.0.1:${UI_PORT}/api/ca.crt`);
 });
 
