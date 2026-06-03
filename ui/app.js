@@ -4,7 +4,9 @@
 'use strict';
 
 // ── Config ───────────────────────────────────────────────────
-const API  = `http://${location.hostname}:8080`;
+// API lives on port 8888 (separate from the proxy on 8080)
+// This separation is what makes traffic capture work correctly.
+const API  = `http://${location.hostname}:8888`;
 const WS   = `ws://${location.hostname}:8081`;
 
 // ── State ────────────────────────────────────────────────────
