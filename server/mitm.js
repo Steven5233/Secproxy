@@ -2,7 +2,7 @@
    server/mitm.js — HTTPS MITM engine
    Séç Proxy v2.0
 
-   applied:
+   Fixes applied:
    - Handles chunked TLS data correctly (accumulate until
      Content-Length or double CRLF, don't drop mid-request)
    - Handles keep-alive connections (multiple requests per tunnel)
@@ -11,6 +11,8 @@
    - TLS errors silenced per-socket so one bad cert doesn't crash all
    ============================================================ */
 'use strict';
+
+require('events').EventEmitter.defaultMaxListeners = 50;
 
 const tls       = require('tls');
 const ca        = require('./ca');
@@ -93,11 +95,21 @@ function isComplete(buf) {
 
 // ── Main CONNECT handler ─────────────────────────────────────
 function handleConnect(clientSocket, hostname, port) {
+  clientSocket.setMaxListeners(50);
+
   // Step 1: ACK the CONNECT
   try {
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
   } catch (e) {
     clientSocket.destroy();
+    return;
+  }
+
+  // If port is not 443 and not a common HTTPS port, use transparent tunnel
+  // This handles things like CONNECT to non-HTTPS ports
+  const httpsPorts = [443, 8443, 8080, 4443, 9443];
+  if (!httpsPorts.includes(port) && port !== 443) {
+    transparentTunnel(clientSocket, hostname, port);
     return;
   }
 
