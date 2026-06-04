@@ -135,10 +135,58 @@ function serveStatic(filePath, clientRes) {
   });
 }
 
-// ── Built-in browser fetch: /proxy-browse?url=... ────────────
-// Routes ALL traffic through proxy.js on port 8080 so that
-// Intercept, Scanner, Match & Replace, and History all work
-// exactly as if the browser had been manually configured.
+// ── Rewrite HTML links to stay inside the built-in browser ───
+function rewriteHTML(html, target, targetUrl) {
+  const base = `${targetUrl.protocol}//${targetUrl.host}`;
+  return html
+    .replace(/(href|src|action)="(https?:\/\/[^"]+)"/gi,
+      (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(u)}"`)
+    .replace(/(href|src|action)="(\/[^"]*?)"/gi,
+      (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(base + u)}"`)
+    .replace(/<head([^>]*)>/i, `<head$1><base href="${target}">`);
+}
+
+// ── Strip headers that break iframe rendering ─────────────────
+// FIX 1: content-length included so we can set our own correct
+//         value after decompression — prevents the parse error
+//         "Content-Length can't be present with Transfer-Encoding"
+const STRIP_HEADERS = new Set([
+  'x-frame-options',
+  'content-security-policy',
+  'content-security-policy-report-only',
+  'content-encoding',
+  'transfer-encoding',
+  'content-length',
+]);
+
+function buildRespHeaders(originHeaders, bodyLength, latencyMs) {
+  const out = {};
+  for (const [k, v] of Object.entries(originHeaders)) {
+    if (!STRIP_HEADERS.has(k.toLowerCase())) out[k] = v;
+  }
+  out['content-length']     = String(bodyLength);
+  out['x-proxy-latency-ms'] = String(latencyMs);
+  return out;
+}
+
+// ── Log request to proxy.js for intercept/history/scanner ─────
+function logToProxy(method, target, targetUrl, headers, body) {
+  const logReq = http.request({
+    hostname: '127.0.0.1',
+    port:     PROXY_PORT,
+    path:     target,
+    method,
+    headers:  { ...headers, host: targetUrl.host },
+  });
+  logReq.on('error', () => {});
+  if (body && body.length) logReq.write(body);
+  logReq.end();
+}
+
+// ── Built-in browser fetch: /proxy-browse?url=... ─────────────
+// FIX 1: strip content-length from origin headers to prevent parse error.
+// FIX 2: fetch HTTPS sites directly server-side — bypasses X-Frame-Options
+//         and "refused to connect" errors. Traffic still logged to proxy.js.
 async function handleProxyBrowse(parsedUrl, req, res) {
   const target = parsedUrl.searchParams.get('url');
   if (!target) {
@@ -148,39 +196,46 @@ async function handleProxyBrowse(parsedUrl, req, res) {
   }
 
   let targetUrl;
-  try {
-    targetUrl = new URL(target);
-  } catch (_) {
+  try { targetUrl = new URL(target); }
+  catch (_) {
     res.writeHead(400, { 'Content-Type': 'text/plain' });
     res.end('Invalid URL');
     return;
   }
 
   const reqBody = await collectBody(req);
+  const isHTTPS = targetUrl.protocol === 'https:';
+  const lib     = isHTTPS ? https : http;
+  const method  = req.method || 'GET';
 
-  // ── Route through the REAL proxy (port 8080) ──────────────
-  // Sending an absolute URL to proxy.js triggers full proxy
-  // handling: intercept, scanner, match & replace, history.
-  const options = {
-    hostname: '127.0.0.1',
-    port:     PROXY_PORT,          // 8080 — goes through proxy.js
-    path:     target,              // absolute URL — proxy.js forwards it
-    method:   req.method || 'GET',
-    headers: {
-      'host':            targetUrl.host,
-      'user-agent':      req.headers['user-agent'] || 'SecProxy-Browser/2.0',
-      'accept':          req.headers['accept'] || 'text/html,*/*',
-      'accept-language': req.headers['accept-language'] || 'en-US,en;q=0.9',
-      'accept-encoding': 'gzip, deflate, br',
-    },
+  const fwdHeaders = {
+    'host':            targetUrl.host,
+    'user-agent':      req.headers['user-agent'] || 'SecProxy-Browser/2.0',
+    'accept':          req.headers['accept']          || 'text/html,application/xhtml+xml,*/*',
+    'accept-language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+    'accept-encoding': 'gzip, deflate, br',
+    'connection':      'close',
+  };
+  if (req.headers['content-type'])  fwdHeaders['content-type']  = req.headers['content-type'];
+  if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
+  if (req.headers['cookie'])        fwdHeaders['cookie']        = req.headers['cookie'];
+
+  // Log to proxy.js so intercept / history / scanner all fire
+  logToProxy(method, target, targetUrl, fwdHeaders, reqBody);
+
+  // FIX 2: fetch directly server-side — no iframe restriction
+  const fetchOpts = {
+    hostname:           targetUrl.hostname,
+    port:               targetUrl.port || (isHTTPS ? 443 : 80),
+    path:               (targetUrl.pathname || '/') + (targetUrl.search || ''),
+    method,
+    headers:            fwdHeaders,
+    rejectUnauthorized: false,
+    timeout:            15000,
   };
 
-  if (req.headers['content-type'])  options.headers['content-type']  = req.headers['content-type'];
-  if (req.headers['authorization']) options.headers['authorization'] = req.headers['authorization'];
-  if (req.headers['cookie'])        options.headers['cookie']        = req.headers['cookie'];
-
   const t0 = Date.now();
-  const fetchReq = http.request(options, async (originRes) => {
+  const fetchReq = lib.request(fetchOpts, async (originRes) => {
     const chunks = [];
     originRes.on('data', c => chunks.push(c));
     originRes.on('end', async () => {
@@ -191,37 +246,33 @@ async function handleProxyBrowse(parsedUrl, req, res) {
       let body  = buf;
 
       if (ct.includes('text/html')) {
-        let html = buf.toString('utf8');
-        const base = `${targetUrl.protocol}//${targetUrl.host}`;
-        html = html
-          .replace(/(href|src|action)="(https?:\/\/[^"]+)"/gi,
-            (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(u)}"`)
-          .replace(/(href|src|action)="(\/[^"]*?)"/gi,
-            (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(base + u)}"`)
-          .replace(/<head([^>]*)>/i, `<head$1><base href="${target}">`);
-        body = Buffer.from(html, 'utf8');
+        body = Buffer.from(rewriteHTML(buf.toString('utf8'), target, targetUrl), 'utf8');
       }
 
-      const respHeaders = {};
-      for (const [k, v] of Object.entries(originRes.headers)) {
-        const kl = k.toLowerCase();
-        if (['x-frame-options', 'content-security-policy',
-             'content-encoding', 'transfer-encoding'].includes(kl)) continue;
-        respHeaders[k] = v;
-      }
-      respHeaders['content-length']     = String(body.length);
-      respHeaders['x-proxy-latency-ms'] = String(Date.now() - t0);
+      // FIX 1: recalculate content-length, strip conflicting headers
+      const respHeaders = buildRespHeaders(originRes.headers, body.length, Date.now() - t0);
 
       try {
         res.writeHead(originRes.statusCode, respHeaders);
         res.end(body);
       } catch (_) {}
     });
+    originRes.on('error', () => { try { res.end(); } catch (_) {} });
+  });
+
+  fetchReq.on('timeout', () => {
+    fetchReq.destroy();
+    try {
+      res.writeHead(504, { 'Content-Type': 'text/html' });
+      res.end('<h2 style="font-family:monospace;color:#f59e0b">Timeout</h2><pre>The server took too long to respond.</pre>');
+    } catch (_) {}
   });
 
   fetchReq.on('error', (e) => {
-    res.writeHead(502, { 'Content-Type': 'text/html' });
-    res.end(`<h2 style="font-family:monospace;color:#f55">Proxy Error</h2><pre>${e.message}</pre>`);
+    try {
+      res.writeHead(502, { 'Content-Type': 'text/html' });
+      res.end(`<h2 style="font-family:monospace;color:#f55">Proxy Error</h2><pre>${e.message}</pre>`);
+    } catch (_) {}
   });
 
   if (reqBody.length) fetchReq.write(reqBody);
