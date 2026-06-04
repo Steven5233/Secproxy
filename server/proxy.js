@@ -1,18 +1,26 @@
 /* ============================================================
-   server/proxy.js — Séç Proxy v2.0
-   
-   TWO separate servers on TWO separate ports:
-     PROXY_PORT (8080) — pure HTTP forward proxy ONLY
-                         captures ALL browser traffic
-     API_PORT   (8888) — REST API for the UI ONLY
-                         never touched by browser traffic
+   server/proxy.js — Séç Proxy v2.0 (Browser Build)
+
+   THREE separate servers:
+     PROXY_PORT (8080) — pure HTTP forward proxy (optional — still
+                         works for traditional proxy mode)
+     API_PORT   (8888) — REST API for the UI
      WS_PORT    (8081) — WebSocket bridge to UI
 
-   .
+   NEW in this build:
+     POST /api/browser/fetch  — server-side fetch so the built-in
+       browser tab can load any URL without needing a proxy config
+       on the device. Android makes zero proxy changes; the Node
+       process does all the network work.
+
+   Architecture: Zero-config Android usage
+     1. Run: node server/proxy.js
+     2. Open http://127.0.0.1:3000 in your Android browser
+     3. Use the "Browser" tab — it fetches via the server, no
+        proxy config needed whatsoever.
    ============================================================ */
 'use strict';
 
-// Prevent MaxListenersExceededWarning on high-traffic proxy sockets
 require('events').EventEmitter.defaultMaxListeners = 50;
 
 const http      = require('http');
@@ -42,9 +50,9 @@ function decompress(buf, enc) {
   return new Promise(res => {
     if (!enc) return res(buf);
     const e = enc.toLowerCase();
-    if (e.includes('gzip'))     return zlib.gunzip(buf,            (er, r) => res(er ? buf : r));
-    if (e.includes('deflate'))  return zlib.inflate(buf,           (er, r) => res(er ? buf : r));
-    if (e.includes('br'))       return zlib.brotliDecompress(buf,  (er, r) => res(er ? buf : r));
+    if (e.includes('gzip'))    return zlib.gunzip(buf,           (er, r) => res(er ? buf : r));
+    if (e.includes('deflate')) return zlib.inflate(buf,          (er, r) => res(er ? buf : r));
+    if (e.includes('br'))      return zlib.brotliDecompress(buf, (er, r) => res(er ? buf : r));
     res(buf);
   });
 }
@@ -101,7 +109,6 @@ function forwardHTTP(reqObj, clientRes) {
       headers:  { ...reqObj.headers },
       rejectUnauthorized: false,
     };
-    // Strip proxy-only headers
     delete opts.headers['proxy-connection'];
     delete opts.headers['proxy-authorization'];
 
@@ -134,17 +141,142 @@ function forwardHTTP(reqObj, clientRes) {
   });
 }
 
+// ── Server-side browser fetch (NEW — zero-config Android) ────
+// The built-in browser tab calls this instead of making direct
+// requests. Node does the HTTP work and returns the full response
+// including body, headers, and status. No proxy config needed.
+async function browserFetch(targetUrl, method, reqHeaders, reqBody) {
+  return new Promise(resolve => {
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch (_) {
+      try { parsed = new URL('https://' + targetUrl); } catch (_) {
+        return resolve({ status: 0, headers: {}, body: '', error: 'Invalid URL', latency_ms: 0, finalUrl: targetUrl });
+      }
+    }
+
+    const isHTTPS = parsed.protocol === 'https:';
+    const lib     = isHTTPS ? https : http;
+
+    // Build safe forwarded headers — strip browser-only / hop-by-hop
+    const fwdHeaders = {};
+    const skip = new Set([
+      'host','connection','keep-alive','proxy-connection','proxy-authorization',
+      'te','trailers','transfer-encoding','upgrade',
+      // security headers the browser adds that we override
+      'origin','referer',
+    ]);
+    for (const [k, v] of Object.entries(reqHeaders || {})) {
+      if (!skip.has(k.toLowerCase())) fwdHeaders[k] = v;
+    }
+    fwdHeaders['host'] = parsed.hostname;
+    // Appear as a real browser
+    if (!fwdHeaders['user-agent']) {
+      fwdHeaders['user-agent'] = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+    }
+    if (!fwdHeaders['accept']) {
+      fwdHeaders['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+    }
+    fwdHeaders['accept-encoding'] = 'gzip, deflate, br';
+
+    const opts = {
+      hostname: parsed.hostname,
+      port:     parsed.port || (isHTTPS ? 443 : 80),
+      path:     (parsed.pathname || '/') + (parsed.search || ''),
+      method:   method || 'GET',
+      headers:  fwdHeaders,
+      rejectUnauthorized: false,
+      timeout: 20000,
+    };
+
+    const t0 = Date.now();
+    const req = lib.request(opts, async originRes => {
+      // Handle redirects (up to 5 hops) — transparently follow them
+      if ([301,302,303,307,308].includes(originRes.statusCode)) {
+        const loc = originRes.headers['location'];
+        if (loc) {
+          let nextUrl;
+          try {
+            nextUrl = new URL(loc, targetUrl).href;
+          } catch (_) {
+            nextUrl = loc;
+          }
+          // Drain response body so socket is freed
+          originRes.resume();
+          // Recurse with GET for 301/302/303, preserve method for 307/308
+          const nextMethod = [307,308].includes(originRes.statusCode) ? method : 'GET';
+          const nextBody   = [307,308].includes(originRes.statusCode) ? reqBody : null;
+          const result = await browserFetch(nextUrl, nextMethod, reqHeaders, nextBody);
+          // Merge latency
+          result.latency_ms = (result.latency_ms || 0) + (Date.now() - t0);
+          result.finalUrl   = result.finalUrl || nextUrl;
+          return resolve(result);
+        }
+      }
+
+      const chunks = [];
+      originRes.on('data', c => chunks.push(c));
+      originRes.on('end',  async () => {
+        const raw  = Buffer.concat(chunks);
+        const buf  = await decompress(raw, originRes.headers['content-encoding']);
+
+        // Determine content type
+        const ct   = (originRes.headers['content-type'] || '').toLowerCase();
+        const isBinary = /image|audio|video|octet-stream|font|woff|zip|pdf/.test(ct);
+
+        let body, base64Body;
+        if (isBinary) {
+          base64Body = buf.toString('base64');
+          body = '';
+        } else {
+          body = buf.toString('utf8');
+        }
+
+        const rh = {};
+        for (const [k, v] of Object.entries(originRes.headers)) rh[k] = v;
+        delete rh['content-encoding'];
+        rh['content-length'] = String(buf.length);
+
+        resolve({
+          status:     originRes.statusCode,
+          headers:    rh,
+          body,
+          base64Body: base64Body || null,
+          isBinary,
+          contentType: ct,
+          latency_ms: Date.now() - t0,
+          finalUrl:   targetUrl,
+        });
+      });
+      originRes.on('error', () => resolve({
+        status: 0, headers: {}, body: '', error: 'Response read error',
+        latency_ms: Date.now() - t0, finalUrl: targetUrl,
+      }));
+    });
+
+    req.setTimeout(20000, () => {
+      req.destroy();
+      resolve({ status: 0, headers: {}, body: '', error: 'Timeout (20s)', latency_ms: Date.now() - t0, finalUrl: targetUrl });
+    });
+
+    req.on('error', e => {
+      resolve({ status: 0, headers: {}, body: '', error: e.message, latency_ms: Date.now() - t0, finalUrl: targetUrl });
+    });
+
+    if (reqBody) req.write(reqBody);
+    req.end();
+  });
+}
+
 // ══════════════════════════════════════════════════════════════
 //  SERVER 1 — PURE PROXY on PROXY_PORT (8080)
-//  This server ONLY handles browser traffic.
-//  It does NOT serve the API. Zero ambiguity.
+//  Kept for optional traditional proxy mode / desktop use.
+//  Android users use the built-in browser instead.
 // ══════════════════════════════════════════════════════════════
 const proxyServer = http.createServer(async (clientReq, clientRes) => {
-  // Increase max listeners on this socket to prevent warning
   clientReq.socket.setMaxListeners(50);
   clientRes.setMaxListeners(50);
-
-  // Absorb socket errors silently (browser closed tab mid-request etc.)
   if (!clientReq.socket._secErrorBound) {
     clientReq.socket._secErrorBound = true;
     clientReq.socket.on('error', () => {});
@@ -154,22 +286,42 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
   const reqUrl = clientReq.url || '/';
   stats.total++;
 
-  // Build full URL — browser proxy requests always send absolute URLs
-  // e.g.  GET http://example.com/path HTTP/1.1
-  // If it's not absolute, the host header tells us where it's going
-  let fullUrl;
-  if (reqUrl.startsWith('http://') || reqUrl.startsWith('https://')) {
-    fullUrl = reqUrl;
-  } else {
-    const hostHeader = clientReq.headers['host'] || 'localhost';
-    fullUrl = `http://${hostHeader}${reqUrl}`;
+  // Direct visit to proxy port → info page
+  if (!reqUrl.startsWith('http://') && !reqUrl.startsWith('https://')) {
+    const hostHeader = (clientReq.headers['host'] || '');
+    if (hostHeader.startsWith('127.0.0.1') || hostHeader.startsWith('localhost')) {
+      const page = `<!DOCTYPE html><html><head><title>Séç Proxy</title>
+<style>body{background:#0a0c0f;color:#00ff9d;font-family:monospace;text-align:center;padding:40px}
+h1{font-size:2em;letter-spacing:4px}p{color:#7a8fa8}code{background:#1e242d;padding:2px 8px;border-radius:3px}</style>
+</head><body>
+<h1>Séç Proxy v2.0</h1>
+<p>Proxy is running on port <code>${PROXY_PORT}</code></p>
+<p>Open the UI at <a href="http://127.0.0.1:3000" style="color:#00ff9d">http://127.0.0.1:3000</a></p>
+<p>Use the <b>Browser</b> tab — no proxy config needed!</p>
+<p>Or set device proxy to <code>127.0.0.1:${PROXY_PORT}</code> to capture all traffic.</p>
+</body></html>`;
+      try {
+        clientRes.writeHead(200, { 'Content-Type': 'text/html' });
+        clientRes.end(page);
+      } catch (_) {}
+      return;
+    }
+    const fullHost = clientReq.headers['host'] || 'localhost';
+    clientReq.url = `http://${fullHost}${reqUrl}`;
   }
 
-  // Collect body
+  const currentUrl = clientReq.url || '/';
+  let fullUrl;
+  if (currentUrl.startsWith('http://') || currentUrl.startsWith('https://')) {
+    fullUrl = currentUrl;
+  } else {
+    const hostHeader = clientReq.headers['host'] || 'localhost';
+    fullUrl = `http://${hostHeader}${currentUrl}`;
+  }
+
   const bodyBuf = await collectBody(clientReq);
   const bodyStr = bodyBuf.length ? bodyBuf.toString('utf8') : '';
 
-  // Copy headers
   const headers = {};
   for (const [k, v] of Object.entries(clientReq.headers)) headers[k] = v;
 
@@ -188,10 +340,8 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
     body:    bodyStr,
   };
 
-  // Apply match-replace on request
   reqObj = intercept.applyMR(reqObj, 'request');
 
-  // Intercept pause (if enabled)
   let finalReq = reqObj;
   try {
     const result = await intercept.pause(reqObj);
@@ -204,7 +354,6 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
     if (intercept.enabled) stats.intercepted++;
   } catch (_) {}
 
-  // Store in DB
   let reqId;
   try {
     reqId = db.insertRequest(finalReq);
@@ -223,27 +372,20 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
     console.error('[Proxy] DB insert error:', e.message);
   }
 
-  // Forward to origin
   const resObj = await forwardHTTP(finalReq, clientRes);
-
-  // Apply match-replace on response
   const modRes = intercept.applyMR(resObj, 'response');
 
-  // Update DB
   try {
     if (reqId != null) {
       db.updateResponse(reqId, modRes);
       stats.bytesOut += (finalReq.body || '').length;
       stats.bytesIn  += (modRes.body  || '').length;
-
-      // Passive scan
       const full = db.getById(reqId);
       const hits = scanner.scan(full);
       if (hits.length) {
         hits.forEach(h => db.addHit({ request_id: reqId, ...h }));
         bridge.emitScannerHit(reqId, hits);
       }
-
       bridge.emitResponse({
         id:          reqId,
         res_status:  modRes.status,
@@ -255,11 +397,9 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
   } catch (e) {
     console.error('[Proxy] DB update error:', e.message);
   }
-
   bridge.emitStats(stats);
 });
 
-// HTTPS CONNECT → MITM
 proxyServer.on('connect', (req, socket, head) => {
   stats.total++;
   socket.setMaxListeners(50);
@@ -273,7 +413,6 @@ proxyServer.on('connect', (req, socket, head) => {
   mitm.handleConnect(socket, hostname, port);
 });
 
-// Client errors (bad request format, etc.)
 proxyServer.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (_) {}
 });
@@ -288,7 +427,7 @@ proxyServer.on('error', e => {
 
 // ══════════════════════════════════════════════════════════════
 //  SERVER 2 — REST API on API_PORT (8888)
-//  Only the Proxy UI talks to this. Browser never touches it.
+//  Includes the new /api/browser/fetch endpoint.
 // ══════════════════════════════════════════════════════════════
 const apiServer = http.createServer(async (req, res) => {
   req.socket.setMaxListeners(50);
@@ -318,8 +457,113 @@ async function handleAPI(pathname, method, bodyStr, res) {
   let body = {};
   try { body = JSON.parse(bodyStr || '{}'); } catch (_) {}
 
-  // Requests
-  if (method === 'GET'  && pathname === '/api/requests')        return sendJSON(res, db.list(1000));
+  // ── NEW: Built-in browser server-side fetch ──────────────
+  // POST /api/browser/fetch
+  //   { url, method?, headers?, body? }
+  // Returns full response captured and logged to history.
+  if (method === 'POST' && pathname === '/api/browser/fetch') {
+    const { url: targetUrl, method: m = 'GET', headers: h = {}, body: b = null } = body;
+    if (!targetUrl) return sendJSON(res, { error: 'url required' }, 400);
+
+    let parsed;
+    try {
+      parsed = new URL(targetUrl.startsWith('http') ? targetUrl : 'https://' + targetUrl);
+    } catch (_) {
+      return sendJSON(res, { error: 'invalid url' }, 400);
+    }
+
+    // Build reqObj to log to DB / intercept
+    let reqObj = {
+      method:  m.toUpperCase(),
+      scheme:  parsed.protocol.replace(':', ''),
+      host:    parsed.hostname,
+      port:    parseInt(parsed.port || (parsed.protocol === 'https:' ? 443 : 80)),
+      path:    (parsed.pathname || '/') + (parsed.search || ''),
+      url:     parsed.href,
+      headers: h,
+      body:    b || '',
+      source:  'browser', // mark as coming from built-in browser
+    };
+
+    // Apply match-replace on request
+    reqObj = intercept.applyMR(reqObj, 'request');
+
+    // Intercept pause
+    let finalReq = reqObj;
+    let intercepted = false;
+    try {
+      const result = await intercept.pause(reqObj);
+      if (result.action === 'drop') {
+        stats.intercepted++;
+        return sendJSON(res, { status: 0, headers: {}, body: '', error: 'Dropped by intercept', latency_ms: 0 });
+      }
+      finalReq = result.request;
+      if (intercept.enabled) { stats.intercepted++; intercepted = true; }
+    } catch (_) {}
+
+    // Log to DB
+    stats.total++;
+    let reqId;
+    try {
+      reqId = db.insertRequest(finalReq);
+      bridge.emitRequest({
+        id:          reqId,
+        method:      finalReq.method,
+        scheme:      finalReq.scheme,
+        host:        finalReq.host,
+        port:        finalReq.port,
+        path:        finalReq.path,
+        url:         finalReq.url,
+        req_headers: finalReq.headers,
+        req_body:    finalReq.body,
+        source:      'browser',
+      });
+    } catch (e) {
+      console.error('[API/browser] DB insert error:', e.message);
+    }
+
+    // Perform server-side fetch
+    const fetchResult = await browserFetch(finalReq.url, finalReq.method, finalReq.headers, finalReq.body);
+
+    // Apply match-replace on response
+    const modRes = intercept.applyMR(fetchResult, 'response');
+
+    // Update DB
+    try {
+      if (reqId != null) {
+        db.updateResponse(reqId, {
+          status:     modRes.status,
+          headers:    modRes.headers,
+          body:       modRes.body,
+          latency_ms: modRes.latency_ms,
+        });
+        stats.bytesOut += (finalReq.body || '').length;
+        stats.bytesIn  += (modRes.body  || '').length;
+
+        const full = db.getById(reqId);
+        const hits = scanner.scan(full);
+        if (hits.length) {
+          hits.forEach(h => db.addHit({ request_id: reqId, ...h }));
+          bridge.emitScannerHit(reqId, hits);
+        }
+        bridge.emitResponse({
+          id:          reqId,
+          res_status:  modRes.status,
+          res_headers: modRes.headers,
+          res_body:    modRes.body,
+          latency_ms:  modRes.latency_ms,
+        });
+      }
+    } catch (e) {
+      console.error('[API/browser] DB update error:', e.message);
+    }
+
+    bridge.emitStats(stats);
+    return sendJSON(res, { ...modRes, reqId });
+  }
+
+  // ── Requests ────────────────────────────────────────────────
+  if (method === 'GET'  && pathname === '/api/requests')         return sendJSON(res, db.list(1000));
   if (method === 'GET'  && /^\/api\/requests\/\d+$/.test(pathname)) {
     const id = parseInt(pathname.split('/')[3]);
     const r  = db.getById(id);
@@ -329,7 +573,7 @@ async function handleAPI(pathname, method, bodyStr, res) {
   if (method === 'POST' && pathname === '/api/requests/clear') { db.clearAll(); return sendJSON(res, { ok: true }); }
   if (method === 'POST' && pathname === '/api/search')         return sendJSON(res, db.search(body.q || ''));
 
-  // Repeater
+  // ── Repeater ────────────────────────────────────────────────
   if (method === 'POST' && pathname === '/api/repeat') {
     const { method: m, url: u, headers: h = {}, body: b } = body;
     if (!u) return sendJSON(res, { error: 'url required' }, 400);
@@ -364,14 +608,14 @@ async function handleAPI(pathname, method, bodyStr, res) {
     return sendJSON(res, result);
   }
 
-  // Intercept
+  // ── Intercept ───────────────────────────────────────────────
   if (method === 'GET'  && pathname === '/api/intercept/status')      return sendJSON(res, { enabled: intercept.enabled, pending: intercept.listPending() });
   if (method === 'POST' && pathname === '/api/intercept/toggle')      { intercept.setEnabled(!intercept.enabled); bridge.emitStatus({ intercept: intercept.enabled }); return sendJSON(res, { enabled: intercept.enabled }); }
   if (method === 'POST' && pathname === '/api/intercept/forward')     return sendJSON(res, { ok: intercept.forward(body.id, body.request) });
   if (method === 'POST' && pathname === '/api/intercept/drop')        return sendJSON(res, { ok: intercept.drop(body.id) });
   if (method === 'POST' && pathname === '/api/intercept/forward-all') { intercept.forwardAll(); return sendJSON(res, { ok: true }); }
 
-  // Rules
+  // ── Rules ────────────────────────────────────────────────────
   if (method === 'GET'    && pathname === '/api/rules')                      return sendJSON(res, db.listRules());
   if (method === 'POST'   && pathname === '/api/rules')                      { db.addRule(body); return sendJSON(res, { ok: true }); }
   if (method === 'DELETE' && /^\/api\/rules\/\d+$/.test(pathname))          { db.deleteRule(parseInt(pathname.split('/')[3])); return sendJSON(res, { ok: true }); }
@@ -379,12 +623,12 @@ async function handleAPI(pathname, method, bodyStr, res) {
   if (method === 'POST'   && pathname === '/api/mr-rules')                   { db.addMR(body); return sendJSON(res, { ok: true }); }
   if (method === 'DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))       { db.deleteMR(parseInt(pathname.split('/')[3])); return sendJSON(res, { ok: true }); }
 
-  // Saved
+  // ── Saved ────────────────────────────────────────────────────
   if (method === 'GET'    && pathname === '/api/saved')                      return sendJSON(res, db.listSaved());
   if (method === 'POST'   && pathname === '/api/saved')                      { db.saveRequest(body); return sendJSON(res, { ok: true }); }
   if (method === 'DELETE' && /^\/api\/saved\/\d+$/.test(pathname))          { db.deleteSaved(parseInt(pathname.split('/')[3])); return sendJSON(res, { ok: true }); }
 
-  // Stats & info
+  // ── Stats & info ─────────────────────────────────────────────
   if (method === 'GET' && pathname === '/api/stats')  return sendJSON(res, { ...stats, uptime: Date.now() - stats.startedAt });
   if (method === 'GET' && pathname === '/api/ca.crt') {
     try {
@@ -405,36 +649,35 @@ intercept.on('paused',    ({ id, request }) => { stats.intercepted++; bridge.emi
 intercept.on('forwarded', ({ id })          => bridge.emitInterceptDone(id, 'forward'));
 intercept.on('dropped',   ({ id })          => bridge.emitInterceptDone(id, 'drop'));
 
-// ── Boot — wait for DB, then start both servers ───────────────
+// ── Boot ──────────────────────────────────────────────────────
 db.init().then(() => {
 
-  // Start proxy server
   proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
     console.log(`[Proxy] Listening on 0.0.0.0:${PROXY_PORT}`);
   });
 
-  // Start API server
   apiServer.listen(API_PORT, '127.0.0.1', () => {
     console.log(`[API]   Listening on 127.0.0.1:${API_PORT}`);
   });
 
-  // Start WebSocket bridge
   bridge.start(WS_PORT);
 
   const lanIP = getLanIP();
   console.log('');
-  console.log('╔══════════════════════════════════════════════════╗');
-  console.log('║           Séç Proxy v2.0 — RUNNING              ║');
-  console.log('╠══════════════════════════════════════════════════╣');
-  console.log(`║  Proxy  → 0.0.0.0:${PROXY_PORT}  (${lanIP})`);
-  console.log(`║  API    → 127.0.0.1:${API_PORT}`);
-  console.log(`║  WS     → ws://0.0.0.0:${WS_PORT}`);
-  console.log('╠══════════════════════════════════════════════════╣');
-  console.log('║  Set browser proxy:');
-  console.log(`║    Host: 127.0.0.1   Port: ${PROXY_PORT}`);
-  console.log(`║  Also use for HTTPS: YES`);
-  console.log('║  CA cert: visit UI → Settings → Download CA');
-  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('╔══════════════════════════════════════════════════════╗');
+  console.log('║         Séç Proxy v2.0 — Browser Build              ║');
+  console.log('╠══════════════════════════════════════════════════════╣');
+  console.log(`║  Proxy  → 0.0.0.0:${PROXY_PORT}  (${lanIP})`.padEnd(55) + '║');
+  console.log(`║  API    → 127.0.0.1:${API_PORT}`.padEnd(55) + '║');
+  console.log(`║  WS     → ws://0.0.0.0:${WS_PORT}`.padEnd(55) + '║');
+  console.log('╠══════════════════════════════════════════════════════╣');
+  console.log('║  ANDROID (zero-config):                              ║');
+  console.log('║    Open http://127.0.0.1:3000 → use Browser tab     ║');
+  console.log('║    No proxy config needed at all!                    ║');
+  console.log('╠══════════════════════════════════════════════════════╣');
+  console.log('║  TRADITIONAL PROXY (optional):                       ║');
+  console.log(`║    Host: 127.0.0.1   Port: ${PROXY_PORT}`.padEnd(55) + '║');
+  console.log('╚══════════════════════════════════════════════════════╝');
   console.log('');
 
 }).catch(e => {
