@@ -8,14 +8,12 @@
                          never touched by browser traffic
      WS_PORT    (8081) — WebSocket bridge to UI
 
-   This separation is the KEY fix. When the browser has its
-   proxy set to 127.0.0.1:8080, EVERY request it makes goes
-   to port 8080. If the API also lives on 8080, the routing
-   logic gets confused and eats real traffic. Putting the API
-   on its own port (8888) means port 8080 is a pure proxy with
-   zero ambiguity — everything arriving there is browser traffic.
+   .
    ============================================================ */
 'use strict';
+
+// Prevent MaxListenersExceededWarning on high-traffic proxy sockets
+require('events').EventEmitter.defaultMaxListeners = 50;
 
 const http      = require('http');
 const https     = require('https');
@@ -142,8 +140,15 @@ function forwardHTTP(reqObj, clientRes) {
 //  It does NOT serve the API. Zero ambiguity.
 // ══════════════════════════════════════════════════════════════
 const proxyServer = http.createServer(async (clientReq, clientRes) => {
-  // Absorb socket errors silently
-  clientReq.socket.on('error', () => {});
+  // Increase max listeners on this socket to prevent warning
+  clientReq.socket.setMaxListeners(50);
+  clientRes.setMaxListeners(50);
+
+  // Absorb socket errors silently (browser closed tab mid-request etc.)
+  if (!clientReq.socket._secErrorBound) {
+    clientReq.socket._secErrorBound = true;
+    clientReq.socket.on('error', () => {});
+  }
   clientRes.on('error', () => {});
 
   const reqUrl = clientReq.url || '/';
@@ -257,7 +262,11 @@ const proxyServer = http.createServer(async (clientReq, clientRes) => {
 // HTTPS CONNECT → MITM
 proxyServer.on('connect', (req, socket, head) => {
   stats.total++;
-  socket.on('error', () => {});
+  socket.setMaxListeners(50);
+  if (!socket._secErrorBound) {
+    socket._secErrorBound = true;
+    socket.on('error', () => {});
+  }
   const parts    = (req.url || '').split(':');
   const hostname = parts[0];
   const port     = parseInt(parts[1] || '443', 10);
@@ -282,7 +291,11 @@ proxyServer.on('error', e => {
 //  Only the Proxy UI talks to this. Browser never touches it.
 // ══════════════════════════════════════════════════════════════
 const apiServer = http.createServer(async (req, res) => {
-  req.socket.on('error', () => {});
+  req.socket.setMaxListeners(50);
+  if (!req.socket._secErrorBound) {
+    req.socket._secErrorBound = true;
+    req.socket.on('error', () => {});
+  }
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders()); res.end(); return;
