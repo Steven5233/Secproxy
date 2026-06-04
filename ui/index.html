@@ -23,6 +23,7 @@
     <button class="mtab" data-tab="decoder">Decoder</button>
     <button class="mtab" data-tab="scanner">Scanner</button>
     <button class="mtab" data-tab="settings">Settings</button>
+    <button class="mtab" data-tab="browser">🌐 Browser</button>
   </nav>
 
   <div class="topbar-right">
@@ -292,6 +293,18 @@
     </div>
 
   </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     TAB: BUILT-IN BROWSER
+════════════════════════════════════════════════════════════ -->
+<div class="tab-content" id="tab-browser">
+  <iframe
+    id="builtinBrowser"
+    src="browser.html"
+    style="width:100%;height:100%;border:none;display:block;"
+    allow="same-origin scripts forms popups"
+  ></iframe>
 </div>
 
 <script src="app.js"></script>
