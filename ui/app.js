@@ -799,3 +799,223 @@ kvAdd('rHdrTable','rHdr','Accept','*/*');
 
 // ── Boot ──────────────────────────────────────────────────────
 wsConnect();
+
+// ══════════════════════════════════════════════════════════════
+//  BUILT-IN BROWSER — inline tab logic
+//  All element IDs are prefixed with "b" to avoid conflicts
+//  with the rest of app.js. Uses fetch('/proxy-browse?url=...')
+//  which is handled by ui-server.js server-side — no iframe,
+//  no CORS issues, no nested-frame problems.
+// ══════════════════════════════════════════════════════════════
+(function () {
+  'use strict';
+
+  // ── DOM refs (only available after tab is first shown) ──────
+  function el(id) { return document.getElementById(id); }
+
+  let bNavHistory = [];
+  let bHistIdx    = -1;
+  let bCurrentUrl = '';
+
+  // ── Public helpers called from inline onclick in index.html ─
+  window.bGo         = function(url) { bLoadUrl(url); };
+  window.bNavigate   = function() {
+    let url = (el('bUrlbar').value || '').trim();
+    if (!url) return;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://' + url;
+    bLoadUrl(url);
+  };
+  window.bGoBack     = function() { if (bHistIdx > 0)                       { bHistIdx--; bFetch(bNavHistory[bHistIdx]); } };
+  window.bGoForward  = function() { if (bHistIdx < bNavHistory.length - 1)  { bHistIdx++; bFetch(bNavHistory[bHistIdx]); } };
+  window.bReload     = function() { if (bCurrentUrl) bFetch(bCurrentUrl); };
+
+  // Proxy navigation/submit handlers — called from rewritten page HTML
+  window._proxyNavigate = function(url) { bLoadUrl(url); };
+  window._proxySubmit   = function(form) {
+    const action = form.getAttribute('data-proxy-action') || bCurrentUrl;
+    const method = form.getAttribute('data-proxy-method') || 'GET';
+    const data   = new URLSearchParams(new FormData(form)).toString();
+    if (method === 'GET') {
+      const sep = action.includes('?') ? '&' : '?';
+      bLoadUrl(action + (data ? sep + data : ''));
+    } else {
+      bFetchWithOpts(action, { method: 'POST', body: data, contentType: 'application/x-www-form-urlencoded' });
+    }
+  };
+
+  // ── Push to history then fetch ────────────────────────────────
+  function bLoadUrl(url) {
+    if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
+    bNavHistory.push(url);
+    bHistIdx = bNavHistory.length - 1;
+    bFetch(url);
+  }
+
+  function bFetch(url) { bFetchWithOpts(url, { method: 'GET' }); }
+
+  // ── Core fetch ────────────────────────────────────────────────
+  async function bFetchWithOpts(url, opts) {
+    bCurrentUrl        = url;
+    const urlbar       = el('bUrlbar');
+    const welcome      = el('bWelcome');
+    const loadOverlay  = el('bLoadOverlay');
+    const errorPane    = el('bErrorPane');
+    const pageContent  = el('bPageContent');
+    const statusText   = el('bStatusText');
+
+    if (urlbar)      urlbar.value = url;
+    if (welcome)     welcome.style.display      = 'none';
+    if (pageContent) pageContent.style.display  = 'none';
+    if (errorPane)   errorPane.style.display    = 'none';
+    if (loadOverlay) { loadOverlay.style.display = 'flex'; }
+    if (el('bLoadMsg')) el('bLoadMsg').textContent = 'Fetching ' + url + '…';
+    if (statusText)  statusText.textContent = '';
+
+    bBumpCapture();
+
+    try {
+      const fetchOpts = { method: opts.method || 'GET', headers: {} };
+      if (opts.body) {
+        fetchOpts.body = opts.body;
+        fetchOpts.headers['Content-Type'] = opts.contentType || 'application/x-www-form-urlencoded';
+      }
+
+      const resp = await fetch('/proxy-browse?url=' + encodeURIComponent(url), fetchOpts);
+
+      // Update URL bar if server followed redirects
+      const finalUrl = resp.headers.get('x-final-url') || url;
+      if (finalUrl !== url) {
+        bCurrentUrl = finalUrl;
+        bNavHistory[bHistIdx] = finalUrl;
+        if (urlbar) urlbar.value = finalUrl;
+      }
+
+      const ct = resp.headers.get('content-type') || '';
+      if (statusText) statusText.textContent = resp.status + ' ' + resp.statusText;
+
+      if (ct.includes('text/html') || ct.includes('text/plain') || !ct) {
+        const html = await resp.text();
+        bRenderHTML(html, finalUrl || url);
+      } else if (ct.includes('application/json')) {
+        const text = await resp.text();
+        bRenderJSON(text);
+      } else if (ct.includes('image/')) {
+        const blob   = await resp.blob();
+        const objUrl = URL.createObjectURL(blob);
+        if (pageContent) {
+          pageContent.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;min-height:200px;background:#111;padding:16px;">
+            <img src="${objUrl}" style="max-width:100%;height:auto;border-radius:4px;">
+          </div>`;
+          bShowContent();
+        }
+      } else {
+        const size = resp.headers.get('content-length') || '?';
+        if (pageContent) {
+          pageContent.innerHTML = `<div style="padding:24px;font-family:monospace;background:#0a0c0f;color:#e2e8f0;min-height:100%;">
+            <h3 style="color:#22c55e;margin-bottom:8px;">Response received</h3>
+            <p style="color:#64748b;">Content-Type: ${bEsc(ct)}</p>
+            <p style="color:#64748b;">Size: ${size} bytes</p>
+            <p style="margin-top:12px;color:#94a3b8;">This content type cannot be rendered inline.</p>
+          </div>`;
+          bShowContent();
+        }
+      }
+    } catch (e) {
+      const loadOverlay = el('bLoadOverlay');
+      const errorPane   = el('bErrorPane');
+      const errMsg      = el('bErrorMsg');
+      if (loadOverlay) loadOverlay.style.display = 'none';
+      if (errorPane)   errorPane.style.display   = 'flex';
+      if (errMsg)      errMsg.textContent = e.message + '\n\nMake sure the target server is running.';
+    }
+  }
+
+  // ── Render HTML — rewrite links/forms to stay in proxy ───────
+  function bRenderHTML(html, baseUrl) {
+    const pageContent = el('bPageContent');
+    if (!pageContent) return;
+
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    // Rewrite <a href>
+    doc.querySelectorAll('a[href]').forEach(a => {
+      const href = a.getAttribute('href');
+      if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
+      try {
+        const abs = new URL(href, baseUrl).href;
+        a.setAttribute('href', 'javascript:void(0)');
+        a.setAttribute('onclick', `window._proxyNavigate(${JSON.stringify(abs)})`);
+      } catch(_) {}
+    });
+
+    // Rewrite <form>
+    doc.querySelectorAll('form').forEach(form => {
+      const action = form.getAttribute('action') || baseUrl;
+      try {
+        const abs = new URL(action, baseUrl).href;
+        form.setAttribute('data-proxy-action', abs);
+        form.setAttribute('data-proxy-method', (form.method || 'GET').toUpperCase());
+        form.setAttribute('action', 'javascript:void(0)');
+        form.setAttribute('onsubmit', 'window._proxySubmit(this); return false;');
+      } catch(_) {}
+    });
+
+    // Rewrite assets through /proxy-browse so they load
+    doc.querySelectorAll('img[src]').forEach(el => {
+      try { el.src  = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('src'),  baseUrl).href); } catch(_) {}
+    });
+    doc.querySelectorAll('link[href]').forEach(el => {
+      try { el.href = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('href'), baseUrl).href); } catch(_) {}
+    });
+    doc.querySelectorAll('script[src]').forEach(el => {
+      try { el.src  = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('src'),  baseUrl).href); } catch(_) {}
+    });
+
+    pageContent.innerHTML = doc.documentElement.outerHTML;
+    bShowContent();
+  }
+
+  function bRenderJSON(text) {
+    const pageContent = el('bPageContent');
+    if (!pageContent) return;
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch(_) {}
+    pageContent.innerHTML = `<pre style="padding:16px;font-family:monospace;font-size:12px;background:#0a0c0f;color:#e2e8f0;white-space:pre-wrap;word-break:break-all;min-height:100%;">${bEsc(pretty)}</pre>`;
+    bShowContent();
+  }
+
+  function bShowContent() {
+    const loadOverlay = el('bLoadOverlay');
+    const errorPane   = el('bErrorPane');
+    const pageContent = el('bPageContent');
+    const pageWrap    = el('bPageWrap');
+    if (loadOverlay) loadOverlay.style.display = 'none';
+    if (errorPane)   errorPane.style.display   = 'none';
+    if (pageContent) pageContent.style.display = 'block';
+    if (pageWrap)    pageWrap.scrollTop        = 0;
+  }
+
+  function bEsc(s) {
+    return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function bBumpCapture() {
+    const dot = el('bCaptureDot');
+    if (!dot) return;
+    dot.style.background = '#f59e0b';
+    setTimeout(() => { dot.style.background = '#22c55e'; }, 800);
+  }
+
+  // ── Sync capture count ────────────────────────────────────────
+  async function bSyncStats() {
+    try {
+      const r = await fetch('/api/stats');
+      const d = await r.json();
+      const c = el('bCaptureCount');
+      if (c && d.total !== undefined) c.textContent = d.total + ' captured';
+    } catch (_) {}
+  }
+  setInterval(bSyncStats, 3000);
+  bSyncStats();
+
+})();
