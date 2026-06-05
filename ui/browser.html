@@ -297,19 +297,77 @@
 
 <script>
   // ── State ────────────────────────────────────────────────
-  const frame     = document.getElementById('pageFrame');
-  const urlbar    = document.getElementById('urlbar');
-  const welcome   = document.getElementById('welcome');
-  const loadOver  = document.getElementById('loadOverlay');
-  const errorPane = document.getElementById('errorPane');
-  const capCount  = document.getElementById('captureCount');
-  const statusEl  = document.getElementById('statusText');
+  const frame      = document.getElementById('pageFrame');
+  const urlbar     = document.getElementById('urlbar');
+  const welcome    = document.getElementById('welcome');
+  const loadOver   = document.getElementById('loadOverlay');
+  const errorPane  = document.getElementById('errorPane');
+  const capCount   = document.getElementById('captureCount');
+  const statusEl   = document.getElementById('statusText');
   const captureDot = document.getElementById('captureDot');
 
-  let history    = [];
-  let histIdx    = -1;
-  let captured   = 0;
-  let loading    = false;
+  let history  = [];
+  let histIdx  = -1;
+  let captured = 0;
+  let loading  = false;
+  let loadTimer = null;
+
+  // ── Injected script that runs inside iframe pages ──────────
+  // Intercepts all link clicks and form submissions, sends them
+  // to the parent via postMessage so we route through /proxy-browse
+  const INJECT_SCRIPT = `
+    (function() {
+      if (window.__secProxyInjected) return;
+      window.__secProxyInjected = true;
+
+      function proxyUrl(url) {
+        try {
+          const abs = new URL(url, location.href).href;
+          if (abs.startsWith(location.origin)) return abs; // same-origin, allow normal
+          window.parent.postMessage({ type: 'navigate', url: abs }, '*');
+          return null;
+        } catch(_) { return null; }
+      }
+
+      // Intercept link clicks
+      document.addEventListener('click', function(e) {
+        const a = e.target.closest('a[href]');
+        if (!a) return;
+        const href = a.getAttribute('href');
+        if (!href || href.startsWith('#') || href.startsWith('javascript')) return;
+        try {
+          const abs = new URL(href, location.href).href;
+          e.preventDefault();
+          e.stopPropagation();
+          window.parent.postMessage({ type: 'navigate', url: abs }, '*');
+        } catch(_) {}
+      }, true);
+
+      // Intercept form submissions
+      document.addEventListener('submit', function(e) {
+        const form = e.target;
+        const method = (form.method || 'GET').toUpperCase();
+        const action = form.action || location.href;
+        try {
+          const abs = new URL(action, location.href).href;
+          e.preventDefault();
+          e.stopPropagation();
+          if (method === 'GET') {
+            const data = new URLSearchParams(new FormData(form)).toString();
+            const sep  = abs.includes('?') ? '&' : '?';
+            window.parent.postMessage({ type: 'navigate', url: abs + (data ? sep + data : '') }, '*');
+          } else {
+            // POST — collect form data and send as body
+            const data = new URLSearchParams(new FormData(form)).toString();
+            window.parent.postMessage({ type: 'submit', url: abs, method: method, body: data, contentType: 'application/x-www-form-urlencoded' }, '*');
+          }
+        } catch(_) {}
+      }, true);
+
+      // Notify parent of current URL after load
+      window.parent.postMessage({ type: 'url_update', url: location.href }, '*');
+    })();
+  `;
 
   // ── Navigate to a URL ─────────────────────────────────────
   function navigate() {
@@ -319,59 +377,100 @@
     loadUrl(url);
   }
 
-  function loadUrl(url) {
-    // Push to history
+  function loadUrl(url, options) {
     if (histIdx < history.length - 1) history = history.slice(0, histIdx + 1);
     history.push(url);
     histIdx = history.length - 1;
-
-    _load(url);
+    _load(url, options);
   }
 
-  function _load(url) {
+  function _load(url, options) {
     urlbar.value = url;
-    welcome.style.display   = 'none';
+    welcome.style.display  = 'none';
     errorPane.classList.remove('show');
-    frame.style.display     = 'none';
+    frame.style.display    = 'none';
     loadOver.classList.add('show');
     document.getElementById('loadMsg').textContent = 'Fetching ' + url + '…';
     statusEl.textContent = '';
     loading = true;
+    clearTimeout(loadTimer);
 
-    const proxyUrl = '/proxy-browse?url=' + encodeURIComponent(url);
+    // Build proxy URL — for POST form submissions include method+body params
+    let proxyUrl = '/proxy-browse?url=' + encodeURIComponent(url);
+
+    if (options && options.method === 'POST') {
+      // For POST forms we can't use iframe src — use fetch and inject into srcdoc
+      _loadPost(url, options);
+      return;
+    }
+
     frame.src = proxyUrl;
 
-    // Timeout fallback (iframe load event unreliable for errors)
-    setTimeout(() => {
+    // Timeout fallback
+    loadTimer = setTimeout(() => {
       if (loading) {
         loading = false;
         loadOver.classList.remove('show');
         frame.style.display = 'block';
+        _injectScript();
       }
     }, 12000);
 
-    // Count as captured
+    _bumpCapture();
+  }
+
+  // ── Handle POST form submissions via fetch → srcdoc ───────
+  async function _loadPost(url, options) {
+    try {
+      const resp = await fetch('/proxy-browse?url=' + encodeURIComponent(url), {
+        method: 'POST',
+        headers: { 'Content-Type': options.contentType || 'application/x-www-form-urlencoded' },
+        body: options.body || '',
+      });
+      const html = await resp.text();
+      frame.srcdoc = html;
+      frame.src    = 'about:blank';
+    } catch(e) {
+      loading = false;
+      loadOver.classList.remove('show');
+      frame.style.display = 'none';
+      errorPane.classList.add('show');
+      document.getElementById('errorMsg').textContent = 'POST error: ' + e.message;
+    }
+  }
+
+  function _bumpCapture() {
     captured++;
     capCount.textContent = captured + ' captured';
     captureDot.className = 'dot yellow';
     setTimeout(() => { captureDot.className = 'dot green'; }, 800);
   }
 
+  // ── Inject interception script into iframe after load ─────
+  function _injectScript() {
+    try {
+      const doc = frame.contentDocument || frame.contentWindow.document;
+      if (!doc) return;
+      const s = doc.createElement('script');
+      s.textContent = INJECT_SCRIPT;
+      (doc.head || doc.body || doc.documentElement).appendChild(s);
+    } catch(_) {
+      // Cross-origin pages block this — links already rewritten server-side
+    }
+  }
+
   function onFrameLoad() {
     loading = false;
+    clearTimeout(loadTimer);
     loadOver.classList.remove('show');
     errorPane.classList.remove('show');
     frame.style.display = 'block';
-
-    // Try to read current URL from frame (works for same-origin proxy responses)
-    try {
-      const loc = frame.contentWindow.location.href;
-      if (loc && loc !== 'about:blank') statusEl.textContent = '';
-    } catch (_) {}
+    _injectScript();
   }
 
   function onFrameError() {
     loading = false;
+    clearTimeout(loadTimer);
     loadOver.classList.remove('show');
     frame.style.display = 'none';
     errorPane.classList.add('show');
@@ -380,42 +479,59 @@
   }
 
   // ── Navigation ────────────────────────────────────────────
-  function goBack() {
-    if (histIdx > 0) { histIdx--; _load(history[histIdx]); }
-  }
+  function goBack()    { if (histIdx > 0)                    { histIdx--; _load(history[histIdx]); } }
+  function goForward() { if (histIdx < history.length - 1)   { histIdx++; _load(history[histIdx]); } }
+  function reload()    { if (history[histIdx]) _load(history[histIdx]); }
+  function openProxyUI() { window.open('/', '_blank'); }
 
-  function goForward() {
-    if (histIdx < history.length - 1) { histIdx++; _load(history[histIdx]); }
-  }
+  // ── Listen for postMessage events from iframe ─────────────
+  // This is the core of FIX 1 — link clicks and form submits
+  // in the iframe page send messages here, we route them through
+  // /proxy-browse so the proxy captures everything.
+  window.addEventListener('message', (e) => {
+    if (!e.data || !e.data.type) return;
 
-  function reload() {
-    if (history[histIdx]) _load(history[histIdx]);
-  }
+    switch (e.data.type) {
+      case 'navigate':
+        // Link click — route through proxy
+        loadUrl(e.data.url);
+        break;
 
-  function openProxyUI() {
-    window.open('/', '_blank');
-  }
+      case 'submit':
+        // Form POST — route through proxy with body
+        _bumpCapture();
+        loadUrl(e.data.url, {
+          method: e.data.method,
+          body: e.data.body,
+          contentType: e.data.contentType,
+        });
+        break;
 
-  // ── Poll proxy for capture count ──────────────────────────
+      case 'url_update':
+        // Page loaded, update URL bar
+        if (e.data.url && e.data.url !== 'about:blank') {
+          // Strip our /proxy-browse?url= wrapper to show real URL
+          try {
+            const u = new URL(e.data.url);
+            const real = u.searchParams.get('url');
+            if (real) urlbar.value = real;
+          } catch(_) {}
+        }
+        break;
+    }
+  });
+
+  // ── Poll proxy for live capture count ─────────────────────
   async function syncStats() {
     try {
       const r = await fetch('/api/stats');
       const d = await r.json();
       if (d.total !== undefined) {
+        captured = d.total;
         capCount.textContent = d.total + ' captured';
       }
     } catch (_) {}
   }
   setInterval(syncStats, 3000);
   syncStats();
-
-  // ── Handle messages from iframe (link clicks rewritten) ───
-  window.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'navigate') {
-      loadUrl(e.data.url);
-    }
-  });
 </script>
-
-</body>
-</html>
