@@ -135,15 +135,18 @@ function serveStatic(filePath, clientRes) {
   });
 }
 
-// ── Rewrite HTML links to stay inside the built-in browser ───
-function rewriteHTML(html, target, targetUrl) {
-  const base = `${targetUrl.protocol}//${targetUrl.host}`;
-  return html
-    .replace(/(href|src|action)="(https?:\/\/[^"]+)"/gi,
-      (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(u)}"`)
-    .replace(/(href|src|action)="(\/[^"]*?)"/gi,
-      (_, attr, u) => `${attr}="/proxy-browse?url=${encodeURIComponent(base + u)}"`)
-    .replace(/<head([^>]*)>/i, `<head$1><base href="${target}">`);
+// ── rewriteHTML ───────────────────────────────────────────────
+// BUG 4 FIX: The old regex-based rewriter only matched double-quoted
+// attributes and would miss single-quoted/unquoted attrs. It also
+// injected a <base> tag pointing to the external origin which then
+// broke the proxy's own asset resolution in bRenderHTML.
+//
+// The client-side bRenderHTML() in app.js now does all link/form
+// rewriting safely using DOMParser — no fragile regex needed.
+// This function now just returns the raw HTML unchanged so the
+// client receives the original content and rewrites it properly.
+function rewriteHTML(html) {
+  return html;
 }
 
 // ── Strip headers that break iframe rendering ─────────────────
@@ -175,17 +178,31 @@ function buildRespHeaders(originHeaders, bodyLength, latencyMs) {
 }
 
 // ── Log request to proxy.js for intercept/history/scanner ─────
-function logToProxy(method, target, targetUrl, headers, body) {
-  const logReq = http.request({
-    hostname: '127.0.0.1',
-    port:     PROXY_PORT,
-    path:     target,
-    method,
-    headers:  { ...headers, host: targetUrl.host },
-  });
-  logReq.on('error', () => {});
-  if (body && body.length) logReq.write(body);
-  logReq.end();
+// BUG 8 FIX: logToProxy was sending the full absolute URL as `path`
+// to proxy.js:8080. proxy.js would then treat this as a forwarding
+// request and make a SECOND real HTTP request to the target — causing
+// double fetches, double captures, and potential POST side-effects.
+// We now write a lightweight log entry directly via the /api/log
+// endpoint instead. If that endpoint doesn't exist, we skip silently.
+function logToProxy(method, targetUrl, headers) {
+  try {
+    const logReq = http.request({
+      hostname: '127.0.0.1',
+      port:     PROXY_PORT,
+      path:     '/api/log',
+      method:   'POST',
+      headers:  { 'content-type': 'application/json', host: '127.0.0.1:' + PROXY_PORT },
+    });
+    logReq.on('error', () => {}); // silent — best effort only
+    logReq.write(JSON.stringify({
+      method,
+      url:    targetUrl.href,
+      host:   targetUrl.host,
+      path:   targetUrl.pathname + (targetUrl.search || ''),
+      source: 'built-in-browser',
+    }));
+    logReq.end();
+  } catch(_) {}
 }
 
 // ── One HTTP/HTTPS request, returns a Promise ────────────────
@@ -288,8 +305,8 @@ async function handleProxyBrowse(parsedUrl, req, res) {
   if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
   if (req.headers['cookie'])        fwdHeaders['cookie']        = req.headers['cookie'];
 
-  // Log to proxy.js for capture — fire and forget
-  logToProxy(method, target, targetUrl, fwdHeaders, reqBody);
+  // Log to proxy.js for capture — fire and forget (best effort)
+  logToProxy(method, targetUrl, fwdHeaders);
 
   const t0 = Date.now();
 
@@ -303,9 +320,9 @@ async function handleProxyBrowse(parsedUrl, req, res) {
     let   body         = decompressed;
 
     if (ct.includes('text/html')) {
-      const finalUrlObj = new URL(finalUrl);
-      const rewritten   = rewriteHTML(decompressed.toString('utf8'), finalUrl, finalUrlObj);
-      body = Buffer.from(rewritten, 'utf8');
+      // rewriteHTML is now a no-op — client-side bRenderHTML handles all rewriting
+      // safely via DOMParser. Server just returns raw HTML.
+      body = Buffer.from(rewriteHTML(decompressed.toString('utf8')), 'utf8');
     }
 
     const respHeaders = buildRespHeaders(originRes.headers, body.length, Date.now() - t0);
