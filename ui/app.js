@@ -937,18 +937,29 @@ wsConnect();
 
     const doc = new DOMParser().parseFromString(html, 'text/html');
 
-    // Rewrite <a href>
+    // BUG 6 FIX: Remove ALL script tags — external JS cannot safely run
+    // inside the proxy page context and can corrupt state or redirect.
+    doc.querySelectorAll('script').forEach(s => s.remove());
+
+    // BUG 2 FIX: Remove <base> tags injected by server-side rewriteHTML —
+    // they point to external origins and break proxy asset resolution.
+    doc.querySelectorAll('base').forEach(b => b.remove());
+
+    // BUG 2 FIX: Remove <meta http-equiv="refresh"> — would redirect proxy page.
+    doc.querySelectorAll('meta[http-equiv="refresh"]').forEach(m => m.remove());
+
+    // Rewrite <a href> — all link clicks stay inside proxy browser
     doc.querySelectorAll('a[href]').forEach(a => {
       const href = a.getAttribute('href');
       if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
       try {
         const abs = new URL(href, baseUrl).href;
         a.setAttribute('href', 'javascript:void(0)');
-        a.setAttribute('onclick', `window._proxyNavigate(${JSON.stringify(abs)})`);
+        a.setAttribute('onclick', 'window._proxyNavigate(' + JSON.stringify(abs) + '); return false;');
       } catch(_) {}
     });
 
-    // Rewrite <form>
+    // Rewrite <form> — all form submissions routed through proxy
     doc.querySelectorAll('form').forEach(form => {
       const action = form.getAttribute('action') || baseUrl;
       try {
@@ -960,18 +971,30 @@ wsConnect();
       } catch(_) {}
     });
 
-    // Rewrite assets through /proxy-browse so they load
-    doc.querySelectorAll('img[src]').forEach(el => {
-      try { el.src  = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('src'),  baseUrl).href); } catch(_) {}
-    });
-    doc.querySelectorAll('link[href]').forEach(el => {
-      try { el.href = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('href'), baseUrl).href); } catch(_) {}
-    });
-    doc.querySelectorAll('script[src]').forEach(el => {
-      try { el.src  = '/proxy-browse?url=' + encodeURIComponent(new URL(el.getAttribute('src'),  baseUrl).href); } catch(_) {}
+    // Rewrite <img src> — load images through proxy
+    doc.querySelectorAll('img[src]').forEach(img => {
+      const src = img.getAttribute('src');
+      if (!src || src.startsWith('data:')) return;
+      try { img.setAttribute('src', '/proxy-browse?url=' + encodeURIComponent(new URL(src, baseUrl).href)); } catch(_) {}
     });
 
-    pageContent.innerHTML = doc.documentElement.outerHTML;
+    // Rewrite <link href> — load stylesheets through proxy (CSS only)
+    doc.querySelectorAll('link[rel="stylesheet"][href], link[rel="icon"][href]').forEach(lnk => {
+      const href = lnk.getAttribute('href');
+      if (!href || href.startsWith('data:')) return;
+      try { lnk.setAttribute('href', '/proxy-browse?url=' + encodeURIComponent(new URL(href, baseUrl).href)); } catch(_) {}
+    });
+
+    // Inject into page content div — use body innerHTML only, not full document
+    // to avoid injecting <html>/<head>/<body> tags that break proxy page structure
+    const bodyEl = doc.body;
+    const headEl = doc.head;
+
+    // Collect inline styles from head to preserve page appearance
+    let styleHtml = '';
+    headEl.querySelectorAll('style').forEach(s => { styleHtml += s.outerHTML; });
+
+    pageContent.innerHTML = styleHtml + (bodyEl ? bodyEl.innerHTML : doc.documentElement.innerHTML);
     bShowContent();
   }
 
