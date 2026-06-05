@@ -273,8 +273,14 @@ async function _fetch(url, options) {
     const proxyUrl = '/proxy-browse?url=' + encodeURIComponent(url);
     const resp = await fetch(proxyUrl, fetchOpts);
 
-    // Handle redirect — follow the Location if present
+    // Update URL bar to the final URL after server-side redirects
     const finalUrl = resp.headers.get('x-final-url') || url;
+    if (finalUrl !== url) {
+      currentUrl   = finalUrl;
+      urlbar.value = finalUrl;
+      // Update history entry to the final URL
+      navHistory[histIdx] = finalUrl;
+    }
     const ct = resp.headers.get('content-type') || '';
     statusEl.textContent = resp.status + ' ' + resp.statusText;
 
