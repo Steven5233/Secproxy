@@ -4,9 +4,7 @@
 'use strict';
 
 // ── Config ───────────────────────────────────────────────────
-// API lives on port 8888 (separate from the proxy on 8080)
-// This separation is what makes traffic capture work correctly.
-const API  = `http://${location.hostname}:8888`;
+const API  = `http://${location.hostname}:8080`;
 const WS   = `ws://${location.hostname}:8081`;
 
 // ── State ────────────────────────────────────────────────────
@@ -175,6 +173,8 @@ async function detailShow(id) {
   if (r.error) return;
   const qH = safeJSON(r.req_headers, {});
   const rH = safeJSON(r.res_headers, {});
+  // Normalise: DB may return headers as object or JSON string — safeJSON handles both
+  // but also guard against null/undefined from incomplete captures
   const wrap = document.getElementById('detailWrap');
   wrap.innerHTML = `
     <div class="detail-tabs" id="dtabs">
@@ -259,24 +259,38 @@ async function clearHistory() {
   document.getElementById('statTotal').textContent = '0 reqs';
 }
 
-function exportHAR() {
-  const entries = filtered.map(r => {
-    const qH=safeJSON(r.req_headers,{}), rH=safeJSON(r.res_headers,{});
+async function exportHAR() {
+  toast('Preparing HAR export…');
+  // Fetch full data for each row (list() omits res_body for performance)
+  const full = await Promise.all(filtered.map(r => api(`/api/requests/${r.id}`)));
+  const entries = full.filter(r => !r.error).map(r => {
+    const qH = safeJSON(r.req_headers, {}), rH = safeJSON(r.res_headers, {});
     return {
-      startedDateTime: new Date(r.ts).toISOString(), time:r.latency_ms||0,
-      request:{ method:r.method, url:r.url, httpVersion:'HTTP/1.1',
-        headers:Object.entries(qH).map(([n,v])=>({name:n,value:String(v)})),
-        queryString:[], cookies:[], headersSize:-1, bodySize:(r.req_body||'').length,
-        postData: r.req_body ? {mimeType:qH['content-type']||'',text:r.req_body} : undefined },
-      response:{ status:r.res_status||0, statusText:'', httpVersion:'HTTP/1.1',
-        headers:Object.entries(rH).map(([n,v])=>({name:n,value:String(v)})),
-        cookies:[], redirectURL:'', headersSize:-1, bodySize:(r.res_body||'').length,
-        content:{size:(r.res_body||'').length, mimeType:rH['content-type']||'', text:r.res_body||''} },
-      cache:{}, timings:{send:0,wait:r.latency_ms||0,receive:0},
+      startedDateTime: new Date(r.ts).toISOString(), time: r.latency_ms || 0,
+      request: {
+        method: r.method, url: r.url, httpVersion: 'HTTP/1.1',
+        headers: Object.entries(qH).map(([n, v]) => ({ name: n, value: String(v) })),
+        queryString: [], cookies: [], headersSize: -1, bodySize: (r.req_body || '').length,
+        postData: r.req_body ? { mimeType: qH['content-type'] || '', text: r.req_body } : undefined,
+      },
+      response: {
+        status: r.res_status || 0, statusText: '', httpVersion: 'HTTP/1.1',
+        headers: Object.entries(rH).map(([n, v]) => ({ name: n, value: String(v) })),
+        cookies: [], redirectURL: '', headersSize: -1, bodySize: (r.res_body || '').length,
+        content: { size: (r.res_body || '').length, mimeType: rH['content-type'] || '', text: r.res_body || '' },
+      },
+      cache: {}, timings: { send: 0, wait: r.latency_ms || 0, receive: 0 },
     };
   });
-  const blob = new Blob([JSON.stringify({log:{version:'1.2',creator:{name:'Séç Proxy',version:'2.0'},entries}},null,2)],{type:'application/json'});
-  const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`secproxy-${Date.now()}.har`; a.click();
+  const blob = new Blob(
+    [JSON.stringify({ log: { version: '1.2', creator: { name: 'Séç Proxy', version: '2.0' }, entries } }, null, 2)],
+    { type: 'application/json' }
+  );
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `secproxy-${Date.now()}.har`;
+  a.click();
+  toast(`Exported ${entries.length} requests ✓`);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -481,16 +495,45 @@ function repCopy() {
 }
 
 async function repLoadFromHist(id, e) {
-  if (e) e.stopPropagation();
+  if (e) { e.stopPropagation(); e.preventDefault(); }
   const r = await api(`/api/requests/${id}`);
-  if (r.error) return;
-  document.getElementById('rUrl').value    = r.url||'';
-  document.getElementById('rMethod').value = r.method||'GET';
+  if (r.error) return toast('Could not load request #' + id);
+  document.getElementById('rUrl').value    = r.url || '';
+  document.getElementById('rMethod').value = r.method || 'GET';
   repColorMethod();
+  // Clear and reload headers
   document.getElementById('rHdrTable').innerHTML = '';
-  Object.entries(safeJSON(r.req_headers,{})).forEach(([k,v]) => kvAdd('rHdrTable','rHdr',k,v));
-  if (r.req_body) document.getElementById('rBodyTA').value = r.req_body;
-  showTab('repeater'); toast('Loaded into Repeater');
+  const hdrs = safeJSON(r.req_headers, {});
+  Object.entries(hdrs).forEach(([k, v]) => kvAdd('rHdrTable', 'rHdr', k, String(v)));
+  kvCount('rHdr');
+  // Load cookies
+  document.getElementById('rCkTable').innerHTML = '';
+  const cookieHdr = hdrs['cookie'] || hdrs['Cookie'] || '';
+  if (cookieHdr) {
+    cookieHdr.split(';').forEach(part => {
+      const eq = part.indexOf('=');
+      if (eq > 0) kvAdd('rCkTable', 'rCk', part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+    });
+    kvCount('rCk');
+  }
+  // Load body
+  if (r.req_body) {
+    document.getElementById('rBodyTA').value = r.req_body;
+    const ct = (safeJSON(r.req_headers, {})['content-type'] || '').toLowerCase();
+    if (ct.includes('application/json') || !ct) {
+      document.querySelectorAll('.btype').forEach(b => b.classList.remove('active'));
+      document.querySelector('.btype[onclick*="json"]')?.classList.add('active');
+      repBodyType = 'json';
+    } else if (ct.includes('form')) {
+      document.querySelectorAll('.btype').forEach(b => b.classList.remove('active'));
+      document.querySelector('.btype[onclick*="form"]')?.classList.add('active');
+      repBodyType = 'form';
+    }
+  } else {
+    document.getElementById('rBodyTA').value = '';
+  }
+  showTab('repeater');
+  toast('Loaded into Repeater ✓');
 }
 
 // ── Resize handle ────────────────────────────────────────────
