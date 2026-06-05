@@ -298,24 +298,89 @@
 <!-- ══════════════════════════════════════════════════════════
      TAB: BUILT-IN BROWSER
 ════════════════════════════════════════════════════════════ -->
-<div class="tab-content" id="tab-browser" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:#0a0c0f;height:100%;">
-  <div style="text-align:center;font-family:monospace;color:#e2e8f0;">
-    <div style="font-size:32px;margin-bottom:12px;">🌐</div>
-    <h2 style="font-size:18px;letter-spacing:1px;margin-bottom:8px;">Built-in Browser</h2>
-    <p style="font-size:12px;color:#64748b;max-width:300px;line-height:1.7;margin-bottom:20px;">
-      Opens as a full-screen standalone page so traffic is captured correctly.
-      No proxy configuration needed.
-    </p>
-    <button onclick="window.open('browser.html','_blank')"
-      style="background:#2563eb;color:#fff;border:none;border-radius:8px;
-             padding:12px 28px;font-size:14px;font-weight:600;cursor:pointer;
-             font-family:monospace;letter-spacing:0.5px;">
-      Open Browser
-    </button>
-    <p style="font-size:10px;color:#334155;margin-top:14px;">
-      Or navigate to: <code style="color:#2563eb">http://127.0.0.1:3000/browser.html</code>
-    </p>
+<div class="tab-content" id="tab-browser" style="flex-direction:column;overflow:hidden;padding:0;">
+
+  <!-- ── Browser top bar ── -->
+  <div id="bTopbar" style="
+    display:flex;align-items:center;gap:6px;padding:6px 8px;
+    background:#111318;border-bottom:1px solid #2a2d35;flex-shrink:0;">
+    <button onclick="bGoBack()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">◀</button>
+    <button onclick="bGoForward()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">▶</button>
+    <button onclick="bReload()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">↺</button>
+    <input id="bUrlbar" type="text" placeholder="http://localhost:8080"
+      onkeydown="if(event.key==='Enter') bNavigate()"
+      spellcheck="false" autocomplete="off"
+      style="flex:1;background:#1a1d24;border:1px solid #2a2d35;border-radius:6px;
+             color:#e2e8f0;font-size:13px;font-family:monospace;padding:5px 10px;
+             outline:none;min-width:0;"/>
+    <button onclick="bNavigate()"
+      style="background:#2563eb;border:none;color:#fff;border-radius:6px;
+             padding:5px 14px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;">Go</button>
   </div>
+
+  <!-- ── Browser info bar ── -->
+  <div style="
+    display:flex;align-items:center;gap:10px;padding:3px 10px;
+    background:#0a0c0f;border-bottom:1px solid #2a2d35;
+    font-size:10px;color:#64748b;flex-shrink:0;">
+    <span style="display:flex;align-items:center;gap:4px;">
+      <span id="bCaptureDot" style="width:6px;height:6px;border-radius:50%;background:#22c55e;display:inline-block;"></span>
+      Proxy active — no config needed
+    </span>
+    <span id="bCaptureCount">0 captured</span>
+    <span id="bStatusText" style="margin-left:auto;"></span>
+  </div>
+
+  <!-- ── Browser page area ── -->
+  <div id="bPageWrap" style="flex:1;overflow:auto;background:#fff;position:relative;">
+
+    <!-- Welcome -->
+    <div id="bWelcome" style="
+      position:absolute;inset:0;display:flex;flex-direction:column;
+      align-items:center;justify-content:center;gap:14px;
+      background:#0a0c0f;color:#64748b;text-align:center;padding:24px;">
+      <div style="font-size:28px;">🔍</div>
+      <h2 style="font-size:16px;color:#e2e8f0;letter-spacing:1px;">Built-in Browser</h2>
+      <p style="font-size:11px;line-height:1.7;max-width:300px;">
+        All traffic is automatically captured.<br>No proxy configuration needed.
+      </p>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:4px;">
+        <span onclick="bGo('http://localhost:8080')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:8080</span>
+        <span onclick="bGo('http://localhost:3000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:3000</span>
+        <span onclick="bGo('http://localhost:5000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:5000</span>
+        <span onclick="bGo('http://localhost:8000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:8000</span>
+        <span onclick="bGo('http://localhost:4000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:4000</span>
+        <span onclick="bGo('http://localhost:1337')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:1337</span>
+      </div>
+    </div>
+
+    <!-- Loading -->
+    <div id="bLoadOverlay" style="
+      position:absolute;inset:0;background:#0a0c0f;
+      display:none;flex-direction:column;align-items:center;
+      justify-content:center;gap:12px;font-size:12px;color:#64748b;z-index:10;">
+      <div style="width:28px;height:28px;border:3px solid #2a2d35;border-top-color:#2563eb;
+                  border-radius:50%;animation:spin 0.7s linear infinite;"></div>
+      <span id="bLoadMsg">Fetching…</span>
+    </div>
+
+    <!-- Error -->
+    <div id="bErrorPane" style="
+      position:absolute;inset:0;background:#0a0c0f;
+      display:none;flex-direction:column;align-items:center;
+      justify-content:center;gap:10px;color:#64748b;
+      padding:24px;text-align:center;z-index:10;">
+      <h2 style="color:#ef4444;font-size:15px;">⚠ Connection Error</h2>
+      <pre id="bErrorMsg" style="font-size:11px;background:#1a1d24;padding:10px 14px;
+           border-radius:6px;max-width:380px;word-break:break-all;white-space:pre-wrap;"></pre>
+      <button onclick="bReload()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;
+              border-radius:4px;padding:5px 14px;cursor:pointer;margin-top:4px;">Try again</button>
+    </div>
+
+    <!-- Page content injected here -->
+    <div id="bPageContent" style="display:none;width:100%;min-height:100%;background:#fff;"></div>
+  </div>
+
 </div>
 
 <script src="app.js"></script>
