@@ -304,16 +304,16 @@
   <div id="bTopbar" style="
     display:flex;align-items:center;gap:6px;padding:6px 8px;
     background:#111318;border-bottom:1px solid #2a2d35;flex-shrink:0;">
-    <button onclick="bGoBack()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">◀</button>
-    <button onclick="bGoForward()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">▶</button>
-    <button onclick="bReload()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">↺</button>
+    <button type="button" onclick="bGoBack()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">◀</button>
+    <button type="button" onclick="bGoForward()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">▶</button>
+    <button type="button" onclick="bReload()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">↺</button>
     <input id="bUrlbar" type="text" placeholder="http://localhost:8080"
-      onkeydown="if(event.key==='Enter') bNavigate()"
+      onkeydown="if(event.key==='Enter'){ event.preventDefault(); bNavigate(); }"
       spellcheck="false" autocomplete="off"
       style="flex:1;background:#1a1d24;border:1px solid #2a2d35;border-radius:6px;
              color:#e2e8f0;font-size:13px;font-family:monospace;padding:5px 10px;
              outline:none;min-width:0;"/>
-    <button onclick="bNavigate()"
+    <button type="button" onclick="bNavigate()"
       style="background:#2563eb;border:none;color:#fff;border-radius:6px;
              padding:5px 14px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;">Go</button>
   </div>
@@ -332,7 +332,7 @@
   </div>
 
   <!-- ── Browser page area ── -->
-  <div id="bPageWrap" style="flex:1;overflow:auto;background:#fff;position:relative;">
+  <div id="bPageWrap" style="flex:1;overflow:auto;background:#0a0c0f;position:relative;">
 
     <!-- Welcome -->
     <div id="bWelcome" style="
@@ -378,7 +378,7 @@
     </div>
 
     <!-- Page content injected here -->
-    <div id="bPageContent" style="display:none;width:100%;min-height:100%;background:#fff;"></div>
+    <div id="bPageContent" style="display:none;width:100%;min-height:100%;background:#fff;color:#000;"></div>
   </div>
 
 </div>
