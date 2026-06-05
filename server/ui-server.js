@@ -177,102 +177,74 @@ function buildRespHeaders(originHeaders, bodyLength, latencyMs) {
   return out;
 }
 
-// ── Log request to proxy.js for intercept/history/scanner ─────
-// BUG 8 FIX: logToProxy was sending the full absolute URL as `path`
-// to proxy.js:8080. proxy.js would then treat this as a forwarding
-// request and make a SECOND real HTTP request to the target — causing
-// double fetches, double captures, and potential POST side-effects.
-// We now write a lightweight log entry directly via the /api/log
-// endpoint instead. If that endpoint doesn't exist, we skip silently.
-function logToProxy(method, targetUrl, headers) {
-  try {
-    const logReq = http.request({
+// ── Route browser request through proxy.js for full capture ──
+// Sends the request to proxy.js:8080 using standard HTTP proxy
+// protocol (absolute URL as path). proxy.js captures, scans,
+// intercepts, and pipes the response back to us — no double fetch,
+// proper capture, intercept, scanner all work.
+async function routeThroughProxy(method, targetUrl, headers, body) {
+  return new Promise((resolve, reject) => {
+    const opts = {
       hostname: '127.0.0.1',
       port:     PROXY_PORT,
-      path:     '/api/log',
-      method:   'POST',
-      headers:  { 'content-type': 'application/json', host: '127.0.0.1:' + PROXY_PORT },
-    });
-    logReq.on('error', () => {}); // silent — best effort only
-    logReq.write(JSON.stringify({
-      method,
-      url:    targetUrl.href,
-      host:   targetUrl.host,
-      path:   targetUrl.pathname + (targetUrl.search || ''),
-      source: 'built-in-browser',
-    }));
-    logReq.end();
-  } catch(_) {}
-}
-
-// ── One HTTP/HTTPS request, returns a Promise ────────────────
-function doRequest(lib, opts, body) {
-  return new Promise((resolve, reject) => {
-    const r = lib.request(opts, (res) => resolve(res));
-    r.on('timeout', () => { r.destroy(); reject(new Error('Request timed out')); });
-    r.on('error',   (e) => reject(e));
-    if (body && body.length) r.write(body);
-    r.end();
-  });
-}
-
-// ── Collect all chunks from a response stream ─────────────────
-function collectResponse(res) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    res.on('data',  (c) => chunks.push(c));
-    res.on('end',   ()  => resolve(Buffer.concat(chunks)));
-    res.on('error', (e) => reject(e));
-  });
-}
-
-// ── Follow redirects server-side, return final response ───────
-async function fetchFollowRedirects(startUrl, method, headers, body, maxRedirects) {
-  let urlObj  = startUrl;
-  let reqBody = body;
-  let reqMethod = method;
-
-  for (let i = 0; i <= maxRedirects; i++) {
-    const isHTTPS = urlObj.protocol === 'https:';
-    const lib     = isHTTPS ? https : http;
-    const opts    = {
-      hostname:           urlObj.hostname,
-      port:               urlObj.port || (isHTTPS ? 443 : 80),
-      path:               (urlObj.pathname || '/') + (urlObj.search || ''),
-      method:             reqMethod,
-      headers:            Object.assign({}, headers, { host: urlObj.host }),
-      rejectUnauthorized: false,
-      timeout:            20000,
+      // Standard HTTP proxy: use absolute URL as path
+      path:     targetUrl.href,
+      method:   method,
+      headers:  Object.assign({}, headers, {
+        host: targetUrl.host,
+      }),
     };
 
-    const originRes = await doRequest(lib, opts, reqBody);
-    const status    = originRes.statusCode;
+    const proxyReq = http.request(opts, (proxyRes) => {
+      const chunks = [];
+      proxyRes.on('data',  c  => chunks.push(c));
+      proxyRes.on('end',   ()  => resolve({ proxyRes, buf: Buffer.concat(chunks) }));
+      proxyRes.on('error', e  => reject(e));
+    });
+
+    proxyReq.on('timeout', () => { proxyReq.destroy(); reject(new Error('Request timed out')); });
+    proxyReq.on('error',   e  => reject(e));
+    proxyReq.setTimeout(25000);
+
+    if (body && body.length) proxyReq.write(body);
+    proxyReq.end();
+  });
+}
+
+// ── Follow redirects through proxy.js ─────────────────────────
+async function proxyBrowseFetch(startUrl, method, headers, body, maxRedirects) {
+  let urlObj    = startUrl;
+  let reqMethod = method;
+  let reqBody   = body;
+
+  for (let i = 0; i <= maxRedirects; i++) {
+    const updatedHeaders = Object.assign({}, headers, { host: urlObj.host });
+    const { proxyRes, buf } = await routeThroughProxy(reqMethod, urlObj, updatedHeaders, reqBody);
+    const status = proxyRes.statusCode;
 
     if ([301, 302, 303, 307, 308].includes(status)) {
-      const loc = originRes.headers['location'];
+      const loc = proxyRes.headers['location'];
       if (loc && i < maxRedirects) {
-        // Drain body to free socket
-        originRes.resume();
-        // 303 and most 301/302 become GET with no body
-        if ([301, 302, 303].includes(status)) {
-          reqMethod = 'GET';
-          reqBody   = null;
-        }
+        if ([301, 302, 303].includes(status)) { reqMethod = 'GET'; reqBody = null; }
         try   { urlObj = new URL(loc, urlObj.href); }
-        catch (_) { throw new Error('Invalid redirect location: ' + loc); }
+        catch (_) { throw new Error('Invalid redirect: ' + loc); }
         continue;
       }
     }
 
-    // Not a redirect (or ran out) — collect and return
-    const buf = await collectResponse(originRes);
-    return { originRes, buf, finalUrl: urlObj.href };
+    return { proxyRes, buf, finalUrl: urlObj.href };
   }
-
   throw new Error('Too many redirects');
 }
 
 // ── Built-in browser fetch: /proxy-browse?url=... ─────────────
+// Routes ALL traffic through proxy.js:8080 so that:
+//   - Requests are captured in Proxy History tab
+//   - Intercept fires when enabled
+//   - Scanner analyses traffic
+//   - Match & Replace rules apply
+// Follows redirects server-side so browser never sees a redirect
+// to an external URL (which causes "Failed to fetch" on Android).
 async function handleProxyBrowse(parsedUrl, req, res) {
   const target = parsedUrl.searchParams.get('url');
   if (!target) {
@@ -293,53 +265,43 @@ async function handleProxyBrowse(parsedUrl, req, res) {
   const method  = req.method || 'GET';
 
   const fwdHeaders = {
-    'host':                    targetUrl.host,
-    'user-agent':              'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'accept':                  'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'accept-language':         'en-US,en;q=0.9',
-    'accept-encoding':         'gzip, deflate, br',
-    'connection':              'close',
+    'host':                      targetUrl.host,
+    'user-agent':                'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'accept-language':           'en-US,en;q=0.9',
+    'accept-encoding':           'gzip, deflate, br',
+    'connection':                'close',
     'upgrade-insecure-requests': '1',
   };
   if (req.headers['content-type'])  fwdHeaders['content-type']  = req.headers['content-type'];
   if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
   if (req.headers['cookie'])        fwdHeaders['cookie']        = req.headers['cookie'];
 
-  // Log to proxy.js for capture — fire and forget (best effort)
-  logToProxy(method, targetUrl, fwdHeaders);
-
   const t0 = Date.now();
 
   try {
-    const { originRes, buf, finalUrl } = await fetchFollowRedirects(
+    const { proxyRes, buf, finalUrl } = await proxyBrowseFetch(
       targetUrl, method, fwdHeaders, reqBody, 10
     );
 
-    const decompressed = await decompress(buf, originRes.headers['content-encoding']);
-    const ct           = originRes.headers['content-type'] || '';
-    let   body         = decompressed;
+    // proxy.js already decompresses — buf is plain text/binary
+    // but content-encoding header is already stripped by proxy.js
+    const ct   = proxyRes.headers['content-type'] || '';
+    const body = buf;
 
-    if (ct.includes('text/html')) {
-      // rewriteHTML is now a no-op — client-side bRenderHTML handles all rewriting
-      // safely via DOMParser. Server just returns raw HTML.
-      body = Buffer.from(rewriteHTML(decompressed.toString('utf8')), 'utf8');
-    }
-
-    const respHeaders = buildRespHeaders(originRes.headers, body.length, Date.now() - t0);
+    const respHeaders = buildRespHeaders(proxyRes.headers, body.length, Date.now() - t0);
     respHeaders['x-final-url'] = finalUrl;
 
-    res.writeHead(originRes.statusCode, respHeaders);
+    res.writeHead(proxyRes.statusCode, respHeaders);
     res.end(body);
 
   } catch (e) {
-    console.error('[proxy-browse] Error fetching', target, ':', e.message);
-    // Always respond so the browser's fetch() gets a proper response
-    // instead of a connection reset (which shows as "Failed to fetch")
-    const errHtml = `<!DOCTYPE html><html><body style="font-family:monospace;background:#0a0c0f;color:#e2e8f0;padding:24px;">
-<h2 style="color:#ef4444;">Connection Error</h2>
-<p style="color:#94a3b8;margin-top:8px;">${e.message}</p>
-<p style="color:#64748b;margin-top:4px;font-size:12px;">Target: ${target}</p>
-</body></html>`;
+    console.error('[proxy-browse] Error:', e.message, 'target:', target);
+    const errHtml = '<!DOCTYPE html><html><body style="font-family:monospace;background:#0a0c0f;color:#e2e8f0;padding:24px;">' +
+      '<h2 style="color:#ef4444;">Connection Error</h2>' +
+      '<p style="color:#94a3b8;margin-top:8px;">' + e.message + '</p>' +
+      '<p style="color:#64748b;margin-top:4px;font-size:12px;">Target: ' + target + '</p>' +
+      '</body></html>';
     try {
       if (!res.headersSent) {
         res.writeHead(502, {
