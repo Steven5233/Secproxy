@@ -843,6 +843,27 @@ wsConnect();
     }
   };
 
+  // ── Listen for messages from sandboxed iframe ────────────────
+  window.addEventListener('message', function(e) {
+    if (!e.data || !e.data.type) return;
+    switch(e.data.type) {
+      case 'proxy-navigate':
+        if (e.data.url) bLoadUrl(e.data.url);
+        break;
+      case 'proxy-submit':
+        if (e.data.url) {
+          if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
+          bNavHistory.push(e.data.url);
+          bHistIdx = bNavHistory.length - 1;
+          bFetchWithOpts(e.data.url, { method: e.data.method, body: e.data.body, contentType: e.data.contentType });
+        }
+        break;
+      case 'proxy-title':
+        // Could update a title indicator — no-op for now
+        break;
+    }
+  });
+
   // ── Push to history then fetch ────────────────────────────────
   function bLoadUrl(url) {
     if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
@@ -930,71 +951,96 @@ wsConnect();
     }
   }
 
-  // ── Render HTML — rewrite links/forms to stay in proxy ───────
+  // ── Render HTML into a sandboxed iframe ─────────────────────
+  // We use <iframe srcdoc> instead of innerHTML because:
+  //  1. Modern sites need JS to render — stripping scripts = blank page
+  //  2. srcdoc iframe is isolated from proxy page context — external JS
+  //     cannot access proxy variables, redirect the proxy page, or
+  //     corrupt proxy state
+  //  3. We inject a small interception script that routes link clicks
+  //     and form submissions back to the proxy via postMessage
   function bRenderHTML(html, baseUrl) {
     const pageContent = el('bPageContent');
     if (!pageContent) return;
 
-    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // Interception script injected into every page — intercepts clicks
+    // and form submits, sends them to parent (proxy) via postMessage
+    const interceptScript = `<script>
+(function() {
+  // Fix all relative URLs to absolute using the real base URL
+  var BASE = ${JSON.stringify(baseUrl)};
+  function abs(u) {
+    try { return new URL(u, BASE).href; } catch(_) { return u; }
+  }
 
-    // BUG 6 FIX: Remove ALL script tags — external JS cannot safely run
-    // inside the proxy page context and can corrupt state or redirect.
-    doc.querySelectorAll('script').forEach(s => s.remove());
+  // Link click interception
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest('a[href]');
+    if (!a) return;
+    var href = a.getAttribute('href');
+    if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.parent.postMessage({ type: 'proxy-navigate', url: abs(href) }, '*');
+  }, true);
 
-    // BUG 2 FIX: Remove <base> tags injected by server-side rewriteHTML —
-    // they point to external origins and break proxy asset resolution.
-    doc.querySelectorAll('base').forEach(b => b.remove());
+  // Form submit interception
+  document.addEventListener('submit', function(e) {
+    var form = e.target;
+    var method = (form.getAttribute('method') || 'GET').toUpperCase();
+    var action = abs(form.getAttribute('action') || location.href);
+    e.preventDefault();
+    e.stopPropagation();
+    if (method === 'GET') {
+      var qs = new URLSearchParams(new FormData(form)).toString();
+      window.parent.postMessage({ type: 'proxy-navigate', url: action + (qs ? (action.includes('?') ? '&' : '?') + qs : '') }, '*');
+    } else {
+      window.parent.postMessage({ type: 'proxy-submit', url: action, method: method, body: new URLSearchParams(new FormData(form)).toString(), contentType: 'application/x-www-form-urlencoded' }, '*');
+    }
+  }, true);
 
-    // BUG 2 FIX: Remove <meta http-equiv="refresh"> — would redirect proxy page.
-    doc.querySelectorAll('meta[http-equiv="refresh"]').forEach(m => m.remove());
+  // Notify parent of page title
+  window.parent.postMessage({ type: 'proxy-title', title: document.title || '' }, '*');
+})();
+<\/script>`;
 
-    // Rewrite <a href> — all link clicks stay inside proxy browser
-    doc.querySelectorAll('a[href]').forEach(a => {
-      const href = a.getAttribute('href');
-      if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
-      try {
-        const abs = new URL(href, baseUrl).href;
-        a.setAttribute('href', 'javascript:void(0)');
-        a.setAttribute('onclick', 'window._proxyNavigate(' + JSON.stringify(abs) + '); return false;');
-      } catch(_) {}
-    });
+    // Inject base tag and interception script before </body>
+    // Base tag ensures all relative URLs resolve correctly inside the iframe
+    const baseTag = '<base href="' + baseUrl + '">';
+    let srcDoc = html;
 
-    // Rewrite <form> — all form submissions routed through proxy
-    doc.querySelectorAll('form').forEach(form => {
-      const action = form.getAttribute('action') || baseUrl;
-      try {
-        const abs = new URL(action, baseUrl).href;
-        form.setAttribute('data-proxy-action', abs);
-        form.setAttribute('data-proxy-method', (form.method || 'GET').toUpperCase());
-        form.setAttribute('action', 'javascript:void(0)');
-        form.setAttribute('onsubmit', 'window._proxySubmit(this); return false;');
-      } catch(_) {}
-    });
+    // Inject base tag into <head> if present, otherwise prepend
+    if (/<head[^>]*>/i.test(srcDoc)) {
+      srcDoc = srcDoc.replace(/(<head[^>]*>)/i, '$1' + baseTag);
+    } else {
+      srcDoc = baseTag + srcDoc;
+    }
 
-    // Rewrite <img src> — load images through proxy
-    doc.querySelectorAll('img[src]').forEach(img => {
-      const src = img.getAttribute('src');
-      if (!src || src.startsWith('data:')) return;
-      try { img.setAttribute('src', '/proxy-browse?url=' + encodeURIComponent(new URL(src, baseUrl).href)); } catch(_) {}
-    });
+    // Inject interception script before </body> if present, otherwise append
+    if (/<\/body>/i.test(srcDoc)) {
+      srcDoc = srcDoc.replace(/<\/body>/i, interceptScript + '</body>');
+    } else {
+      srcDoc += interceptScript;
+    }
 
-    // Rewrite <link href> — load stylesheets through proxy (CSS only)
-    doc.querySelectorAll('link[rel="stylesheet"][href], link[rel="icon"][href]').forEach(lnk => {
-      const href = lnk.getAttribute('href');
-      if (!href || href.startsWith('data:')) return;
-      try { lnk.setAttribute('href', '/proxy-browse?url=' + encodeURIComponent(new URL(href, baseUrl).href)); } catch(_) {}
-    });
+    // Remove existing <base> tags that might conflict
+    srcDoc = srcDoc.replace(/<base[^>]*>/gi, '').replace(/(<head[^>]*>)/i, '$1' + baseTag);
 
-    // Inject into page content div — use body innerHTML only, not full document
-    // to avoid injecting <html>/<head>/<body> tags that break proxy page structure
-    const bodyEl = doc.body;
-    const headEl = doc.head;
+    // Clear old iframe if exists
+    var oldFrame = pageContent.querySelector('iframe.proxy-frame');
+    if (oldFrame) oldFrame.remove();
 
-    // Collect inline styles from head to preserve page appearance
-    let styleHtml = '';
-    headEl.querySelectorAll('style').forEach(s => { styleHtml += s.outerHTML; });
+    // Create sandboxed iframe
+    var frame = document.createElement('iframe');
+    frame.className = 'proxy-frame';
+    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals');
+    frame.style.cssText = 'width:100%;height:100%;border:none;display:block;background:#fff;';
+    frame.srcdoc = srcDoc;
+    pageContent.style.height = '100%';
+    pageContent.style.padding = '0';
+    pageContent.style.overflow = 'hidden';
+    pageContent.appendChild(frame);
 
-    pageContent.innerHTML = styleHtml + (bodyEl ? bodyEl.innerHTML : doc.documentElement.innerHTML);
     bShowContent();
   }
 
