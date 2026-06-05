@@ -189,9 +189,9 @@ function logToProxy(method, target, targetUrl, headers, body) {
 }
 
 // ── Built-in browser fetch: /proxy-browse?url=... ─────────────
-// FIX 1: strip content-length from origin headers to prevent parse error.
-// FIX 2: fetch HTTPS sites directly server-side — bypasses X-Frame-Options
-//         and "refused to connect" errors. Traffic still logged to proxy.js.
+// Fetches the target URL server-side (bypasses CORS/X-Frame-Options),
+// follows redirects automatically, decompresses, rewrites HTML links,
+// and returns the final page to browser.html's fetch() call.
 async function handleProxyBrowse(parsedUrl, req, res) {
   const target = parsedUrl.searchParams.get('url');
   if (!target) {
@@ -209,79 +209,103 @@ async function handleProxyBrowse(parsedUrl, req, res) {
   }
 
   const reqBody = await collectBody(req);
-  const isHTTPS = targetUrl.protocol === 'https:';
-  const lib     = isHTTPS ? https : http;
   const method  = req.method || 'GET';
 
   const fwdHeaders = {
     'host':            targetUrl.host,
-    'user-agent':      req.headers['user-agent'] || 'SecProxy-Browser/2.0',
-    'accept':          req.headers['accept']          || 'text/html,application/xhtml+xml,*/*',
-    'accept-language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+    'user-agent':      'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.9',
     'accept-encoding': 'gzip, deflate, br',
     'connection':      'close',
+    'upgrade-insecure-requests': '1',
   };
   if (req.headers['content-type'])  fwdHeaders['content-type']  = req.headers['content-type'];
   if (req.headers['authorization']) fwdHeaders['authorization'] = req.headers['authorization'];
   if (req.headers['cookie'])        fwdHeaders['cookie']        = req.headers['cookie'];
 
-  // Log to proxy.js so intercept / history / scanner all fire
+  // Log to proxy.js for capture (fire and forget)
   logToProxy(method, target, targetUrl, fwdHeaders, reqBody);
 
-  // FIX 2: fetch directly server-side — no iframe restriction
-  const fetchOpts = {
-    hostname:           targetUrl.hostname,
-    port:               targetUrl.port || (isHTTPS ? 443 : 80),
-    path:               (targetUrl.pathname || '/') + (targetUrl.search || ''),
-    method,
-    headers:            fwdHeaders,
-    rejectUnauthorized: false,
-    timeout:            15000,
-  };
-
   const t0 = Date.now();
-  const fetchReq = lib.request(fetchOpts, async (originRes) => {
-    const chunks = [];
-    originRes.on('data', c => chunks.push(c));
-    originRes.on('end', async () => {
-      const raw = Buffer.concat(chunks);
-      const buf = await decompress(raw, originRes.headers['content-encoding']);
 
-      const ct = originRes.headers['content-type'] || '';
-      let body  = buf;
+  // Follow up to 10 redirects server-side so the client never sees a redirect
+  // to an external URL (which would cause "Failed to fetch" on Android WebView)
+  async function doFetch(urlObj, redirectsLeft) {
+    return new Promise((resolve, reject) => {
+      const isHTTPS = urlObj.protocol === 'https:';
+      const lib     = isHTTPS ? https : http;
 
-      if (ct.includes('text/html')) {
-        body = Buffer.from(rewriteHTML(buf.toString('utf8'), target, targetUrl), 'utf8');
-      }
+      const opts = {
+        hostname:           urlObj.hostname,
+        port:               urlObj.port || (isHTTPS ? 443 : 80),
+        path:               (urlObj.pathname || '/') + (urlObj.search || ''),
+        method:             redirectsLeft < 10 ? 'GET' : method, // redirects always GET
+        headers:            { ...fwdHeaders, host: urlObj.host },
+        rejectUnauthorized: false,
+        timeout:            20000,
+      };
 
-      // FIX 1: recalculate content-length, strip conflicting headers
-      const respHeaders = buildRespHeaders(originRes.headers, body.length, Date.now() - t0);
+      const r = lib.request(opts, (originRes) => {
+        const status = originRes.statusCode;
 
-      try {
-        res.writeHead(originRes.statusCode, respHeaders);
-        res.end(body);
-      } catch (_) {}
+        // Follow 3xx redirects server-side
+        if ([301,302,303,307,308].includes(status) && redirectsLeft > 0) {
+          const loc = originRes.headers['location'];
+          if (loc) {
+            // Drain the body so the socket is freed
+            originRes.resume();
+            try {
+              const nextUrl = new URL(loc, urlObj.href);
+              resolve(doFetch(nextUrl, redirectsLeft - 1));
+            } catch(_) {
+              reject(new Error('Bad redirect location: ' + loc));
+            }
+            return;
+          }
+        }
+
+        const chunks = [];
+        originRes.on('data', c => chunks.push(c));
+        originRes.on('end', () => resolve({ originRes, buf: Buffer.concat(chunks), finalUrl: urlObj.href }));
+        originRes.on('error', reject);
+      });
+
+      r.on('timeout', () => { r.destroy(); reject(new Error('Request timed out after 20s')); });
+      r.on('error', reject);
+      if (reqBody.length && redirectsLeft === 10) r.write(reqBody);
+      r.end();
     });
-    originRes.on('error', () => { try { res.end(); } catch (_) {} });
-  });
+  }
 
-  fetchReq.on('timeout', () => {
-    fetchReq.destroy();
+  try {
+    const { originRes, buf, finalUrl } = await doFetch(targetUrl, 10);
+
+    const decompressed = await decompress(buf, originRes.headers['content-encoding']);
+    const ct = originRes.headers['content-type'] || '';
+    let body  = decompressed;
+
+    if (ct.includes('text/html')) {
+      // Use the final URL (after redirects) as the base for link rewriting
+      const finalUrlObj = new URL(finalUrl);
+      body = Buffer.from(rewriteHTML(decompressed.toString('utf8'), finalUrl, finalUrlObj), 'utf8');
+    }
+
+    const respHeaders = buildRespHeaders(originRes.headers, body.length, Date.now() - t0);
+    // Tell browser.html what the final URL was (after redirects)
+    respHeaders['x-final-url'] = finalUrl;
+
     try {
-      res.writeHead(504, { 'Content-Type': 'text/html' });
-      res.end('<h2 style="font-family:monospace;color:#f59e0b">Timeout</h2><pre>The server took too long to respond.</pre>');
+      res.writeHead(originRes.statusCode, respHeaders);
+      res.end(body);
     } catch (_) {}
-  });
 
-  fetchReq.on('error', (e) => {
+  } catch (e) {
     try {
-      res.writeHead(502, { 'Content-Type': 'text/html' });
-      res.end(`<h2 style="font-family:monospace;color:#f55">Proxy Error</h2><pre>${e.message}</pre>`);
+      res.writeHead(502, { 'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*' });
+      res.end(`<h2 style="font-family:monospace;color:#ef4444;padding:20px">Connection Error</h2><pre style="padding:0 20px;color:#94a3b8">${e.message}</pre>`);
     } catch (_) {}
-  });
-
-  if (reqBody.length) fetchReq.write(reqBody);
-  fetchReq.end();
+  }
 }
 
 // ── Main server ───────────────────────────────────────────────
