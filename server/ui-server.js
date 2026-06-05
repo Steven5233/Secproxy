@@ -164,8 +164,13 @@ function buildRespHeaders(originHeaders, bodyLength, latencyMs) {
   for (const [k, v] of Object.entries(originHeaders)) {
     if (!STRIP_HEADERS.has(k.toLowerCase())) out[k] = v;
   }
-  out['content-length']     = String(bodyLength);
-  out['x-proxy-latency-ms'] = String(latencyMs);
+  out['content-length']                = String(bodyLength);
+  out['x-proxy-latency-ms']            = String(latencyMs);
+  // Always allow fetch() from any origin — critical for browser.html
+  // running inside an iframe context on Android WebView
+  out['access-control-allow-origin']   = '*';
+  out['access-control-allow-headers']  = '*';
+  out['access-control-allow-methods']  = 'GET,POST,PUT,DELETE,OPTIONS';
   return out;
 }
 
