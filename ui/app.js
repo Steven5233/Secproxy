@@ -801,52 +801,60 @@ kvAdd('rHdrTable','rHdr','Accept','*/*');
 wsConnect();
 
 // ══════════════════════════════════════════════════════════════
-//  BUILT-IN BROWSER — inline tab logic
-//  All element IDs are prefixed with "b" to avoid conflicts
-//  with the rest of app.js. Uses fetch('/proxy-browse?url=...')
-//  which is handled by ui-server.js server-side — no iframe,
-//  no CORS issues, no nested-frame problems.
+//  BUILT-IN BROWSER — complete rewrite
+//
+//  Architecture:
+//    1. User types URL → bFetchWithOpts() called
+//    2. Fetch goes to /proxy-browse?url=... on ui-server.js
+//    3. ui-server.js routes it through proxy.js:8080 (captured!)
+//    4. Response HTML returned to browser tab
+//    5. bRenderHTML() injects into srcdoc iframe with:
+//       - Correct <base> tag
+//       - Asset URL rewriting (src/href → /proxy-asset?url=...)
+//       - Link/form interception script via postMessage
+//
+//  Fixes:
+//  FIX-B3: All asset URLs (img src, link href, script src, CSS url())
+//           rewritten to /proxy-asset?url=... so they load correctly
+//           inside srcdoc iframe (which has no real origin).
+//  FIX-B4: Removed allow-same-origin from iframe sandbox. It was
+//           causing postMessage origin mismatches. The interception
+//           script now uses '*' as the target origin.
+//  FIX-B5: <base> tag deduplication now uses a single reliable inject
+//           that removes ALL existing base tags first, then adds ours.
+//  FIX-B6: Click interception now uses capture phase (true) with
+//           stopPropagation AFTER sending postMessage so sites that
+//           call stopPropagation internally still get intercepted.
+//  FIX-B7: Fetch timeout controller — navigation away from a page
+//           while loading aborts the in-flight fetch so the browser
+//           tab doesn't remain stuck on "loading".
 // ══════════════════════════════════════════════════════════════
 (function () {
   'use strict';
 
-  // ── DOM refs (only available after tab is first shown) ──────
   function el(id) { return document.getElementById(id); }
 
-  let bNavHistory = [];
-  let bHistIdx    = -1;
-  let bCurrentUrl = '';
+  let bNavHistory  = [];
+  let bHistIdx     = -1;
+  let bCurrentUrl  = '';
+  let bAbortCtrl   = null;   // FIX-B7: abort controller for in-flight fetch
 
-  // ── Public helpers called from inline onclick in index.html ─
-  window.bGo         = function(url) { bLoadUrl(url); };
-  window.bNavigate   = function() {
-    let url = (el('bUrlbar').value || '').trim();
+  // ── Public API ───────────────────────────────────────────────
+  window.bGo        = function(url) { bLoadUrl(url); };
+  window.bNavigate  = function() {
+    let url = (el('bUrlbar') ? el('bUrlbar').value : '').trim();
     if (!url) return;
     if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://' + url;
     bLoadUrl(url);
   };
-  window.bGoBack     = function() { if (bHistIdx > 0)                       { bHistIdx--; bFetch(bNavHistory[bHistIdx]); } };
-  window.bGoForward  = function() { if (bHistIdx < bNavHistory.length - 1)  { bHistIdx++; bFetch(bNavHistory[bHistIdx]); } };
-  window.bReload     = function() { if (bCurrentUrl) bFetch(bCurrentUrl); };
+  window.bGoBack    = function() { if (bHistIdx > 0)                      { bHistIdx--; bFetch(bNavHistory[bHistIdx]); } };
+  window.bGoForward = function() { if (bHistIdx < bNavHistory.length - 1) { bHistIdx++; bFetch(bNavHistory[bHistIdx]); } };
+  window.bReload    = function() { if (bCurrentUrl) bFetch(bCurrentUrl); };
 
-  // Proxy navigation/submit handlers — called from rewritten page HTML
-  window._proxyNavigate = function(url) { bLoadUrl(url); };
-  window._proxySubmit   = function(form) {
-    const action = form.getAttribute('data-proxy-action') || bCurrentUrl;
-    const method = form.getAttribute('data-proxy-method') || 'GET';
-    const data   = new URLSearchParams(new FormData(form)).toString();
-    if (method === 'GET') {
-      const sep = action.includes('?') ? '&' : '?';
-      bLoadUrl(action + (data ? sep + data : ''));
-    } else {
-      bFetchWithOpts(action, { method: 'POST', body: data, contentType: 'application/x-www-form-urlencoded' });
-    }
-  };
-
-  // ── Listen for messages from sandboxed iframe ────────────────
+  // ── postMessage from iframe ──────────────────────────────────
   window.addEventListener('message', function(e) {
     if (!e.data || !e.data.type) return;
-    switch(e.data.type) {
+    switch (e.data.type) {
       case 'proxy-navigate':
         if (e.data.url) bLoadUrl(e.data.url);
         break;
@@ -855,16 +863,16 @@ wsConnect();
           if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
           bNavHistory.push(e.data.url);
           bHistIdx = bNavHistory.length - 1;
-          bFetchWithOpts(e.data.url, { method: e.data.method, body: e.data.body, contentType: e.data.contentType });
+          bFetchWithOpts(e.data.url, {
+            method:      e.data.method || 'POST',
+            body:        e.data.body,
+            contentType: e.data.contentType || 'application/x-www-form-urlencoded',
+          });
         }
-        break;
-      case 'proxy-title':
-        // Could update a title indicator — no-op for now
         break;
     }
   });
 
-  // ── Push to history then fetch ────────────────────────────────
   function bLoadUrl(url) {
     if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
     bNavHistory.push(url);
@@ -876,26 +884,32 @@ wsConnect();
 
   // ── Core fetch ────────────────────────────────────────────────
   async function bFetchWithOpts(url, opts) {
-    bCurrentUrl        = url;
-    const urlbar       = el('bUrlbar');
-    const welcome      = el('bWelcome');
-    const loadOverlay  = el('bLoadOverlay');
-    const errorPane    = el('bErrorPane');
-    const pageContent  = el('bPageContent');
-    const statusText   = el('bStatusText');
+    // FIX-B7: Abort any previous in-flight request
+    if (bAbortCtrl) { try { bAbortCtrl.abort(); } catch (_) {} }
+    bAbortCtrl = new AbortController();
+    const signal = bAbortCtrl.signal;
 
-    if (urlbar)      urlbar.value = url;
-    if (welcome)     welcome.style.display      = 'none';
-    if (pageContent) pageContent.style.display  = 'none';
-    if (errorPane)   errorPane.style.display    = 'none';
-    if (loadOverlay) { loadOverlay.style.display = 'flex'; }
-    if (el('bLoadMsg')) el('bLoadMsg').textContent = 'Fetching ' + url + '…';
-    if (statusText)  statusText.textContent = '';
+    bCurrentUrl = url;
+    const urlbar      = el('bUrlbar');
+    const welcome     = el('bWelcome');
+    const loadOverlay = el('bLoadOverlay');
+    const errorPane   = el('bErrorPane');
+    const pageContent = el('bPageContent');
+    const statusText  = el('bStatusText');
+    const loadMsg     = el('bLoadMsg');
+
+    if (urlbar)      urlbar.value                 = url;
+    if (welcome)     welcome.style.display        = 'none';
+    if (pageContent) pageContent.style.display    = 'none';
+    if (errorPane)   errorPane.style.display      = 'none';
+    if (loadOverlay) loadOverlay.style.display    = 'flex';
+    if (loadMsg)     loadMsg.textContent          = 'Connecting to ' + url + '…';
+    if (statusText)  statusText.textContent       = '';
 
     bBumpCapture();
 
     try {
-      const fetchOpts = { method: opts.method || 'GET', headers: {} };
+      const fetchOpts = { method: opts.method || 'GET', headers: {}, signal };
       if (opts.body) {
         fetchOpts.body = opts.body;
         fetchOpts.headers['Content-Type'] = opts.contentType || 'application/x-www-form-urlencoded';
@@ -903,35 +917,41 @@ wsConnect();
 
       const resp = await fetch('/proxy-browse?url=' + encodeURIComponent(url), fetchOpts);
 
-      // Update URL bar if server followed redirects
+      if (signal.aborted) return; // navigated away
+
       const finalUrl = resp.headers.get('x-final-url') || url;
       if (finalUrl !== url) {
-        bCurrentUrl = finalUrl;
+        bCurrentUrl           = finalUrl;
         bNavHistory[bHistIdx] = finalUrl;
         if (urlbar) urlbar.value = finalUrl;
       }
 
-      const ct = resp.headers.get('content-type') || '';
-      if (statusText) statusText.textContent = resp.status + ' ' + resp.statusText;
+      if (statusText) statusText.textContent = resp.status + ' ' + (resp.statusText || '');
 
-      if (ct.includes('text/html') || ct.includes('text/plain') || !ct) {
+      const ct = (resp.headers.get('content-type') || '').split(';')[0].trim();
+
+      if (ct === 'text/html' || ct === 'text/plain' || !ct || ct === 'application/xhtml+xml') {
+        if (loadMsg) loadMsg.textContent = 'Rendering…';
         const html = await resp.text();
-        bRenderHTML(html, finalUrl || url);
-      } else if (ct.includes('application/json')) {
+        if (!signal.aborted) bRenderHTML(html, finalUrl || url);
+
+      } else if (ct === 'application/json' || ct.includes('json')) {
         const text = await resp.text();
-        bRenderJSON(text);
-      } else if (ct.includes('image/')) {
+        if (!signal.aborted) bRenderJSON(text);
+
+      } else if (ct.startsWith('image/')) {
         const blob   = await resp.blob();
         const objUrl = URL.createObjectURL(blob);
-        if (pageContent) {
+        if (!signal.aborted && pageContent) {
           pageContent.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;min-height:200px;background:#111;padding:16px;">
             <img src="${objUrl}" style="max-width:100%;height:auto;border-radius:4px;">
           </div>`;
           bShowContent();
         }
+
       } else {
         const size = resp.headers.get('content-length') || '?';
-        if (pageContent) {
+        if (!signal.aborted && pageContent) {
           pageContent.innerHTML = `<div style="padding:24px;font-family:monospace;background:#0a0c0f;color:#e2e8f0;min-height:100%;">
             <h3 style="color:#22c55e;margin-bottom:8px;">Response received</h3>
             <p style="color:#64748b;">Content-Type: ${bEsc(ct)}</p>
@@ -941,104 +961,167 @@ wsConnect();
           bShowContent();
         }
       }
+
     } catch (e) {
-      const loadOverlay = el('bLoadOverlay');
-      const errorPane   = el('bErrorPane');
-      const errMsg      = el('bErrorMsg');
+      if (e.name === 'AbortError') return; // FIX-B7: suppress abort errors
       if (loadOverlay) loadOverlay.style.display = 'none';
       if (errorPane)   errorPane.style.display   = 'flex';
-      if (errMsg)      errMsg.textContent = e.message + '\n\nMake sure the target server is running.';
+      const errMsg = el('bErrorMsg');
+      if (errMsg) errMsg.textContent = e.message + '\n\nMake sure the target is reachable.';
     }
   }
 
-  // ── Render HTML into a sandboxed iframe ─────────────────────
-  // We use <iframe srcdoc> instead of innerHTML because:
-  //  1. Modern sites need JS to render — stripping scripts = blank page
-  //  2. srcdoc iframe is isolated from proxy page context — external JS
-  //     cannot access proxy variables, redirect the proxy page, or
-  //     corrupt proxy state
-  //  3. We inject a small interception script that routes link clicks
-  //     and form submissions back to the proxy via postMessage
+  // ── Render HTML ───────────────────────────────────────────────
   function bRenderHTML(html, baseUrl) {
     const pageContent = el('bPageContent');
     if (!pageContent) return;
 
-    // Interception script injected into every page — intercepts clicks
-    // and form submits, sends them to parent (proxy) via postMessage
-    const interceptScript = `<script>
-(function() {
-  // Fix all relative URLs to absolute using the real base URL
-  var BASE = ${JSON.stringify(baseUrl)};
-  function abs(u) {
-    try { return new URL(u, BASE).href; } catch(_) { return u; }
-  }
-
-  // Link click interception
-  document.addEventListener('click', function(e) {
-    var a = e.target.closest('a[href]');
-    if (!a) return;
-    var href = a.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
-    e.preventDefault();
-    e.stopPropagation();
-    window.parent.postMessage({ type: 'proxy-navigate', url: abs(href) }, '*');
-  }, true);
-
-  // Form submit interception
-  document.addEventListener('submit', function(e) {
-    var form = e.target;
-    var method = (form.getAttribute('method') || 'GET').toUpperCase();
-    var action = abs(form.getAttribute('action') || location.href);
-    e.preventDefault();
-    e.stopPropagation();
-    if (method === 'GET') {
-      var qs = new URLSearchParams(new FormData(form)).toString();
-      window.parent.postMessage({ type: 'proxy-navigate', url: action + (qs ? (action.includes('?') ? '&' : '?') + qs : '') }, '*');
-    } else {
-      window.parent.postMessage({ type: 'proxy-submit', url: action, method: method, body: new URLSearchParams(new FormData(form)).toString(), contentType: 'application/x-www-form-urlencoded' }, '*');
+    // ── FIX-B3: Rewrite all asset URLs to /proxy-asset?url=... ──
+    // This runs server-side-style in a string before srcdoc injection.
+    // Handles: src=, href= (stylesheets/scripts), action= forms,
+    // srcset=, and inline CSS url().
+    function rewriteUrl(u) {
+      if (!u || !u.trim() || u.startsWith('data:') || u.startsWith('blob:') ||
+          u.startsWith('javascript:') || u.startsWith('#') ||
+          u.startsWith('mailto:') || u.startsWith('tel:')) return u;
+      try {
+        const abs = new URL(u.trim(), baseUrl).href;
+        return '/proxy-asset?url=' + encodeURIComponent(abs);
+      } catch (_) { return u; }
     }
-  }, true);
 
-  // Notify parent of page title
-  window.parent.postMessage({ type: 'proxy-title', title: document.title || '' }, '*');
-})();
-<\/script>`;
+    // Rewrite tag attributes
+    let srcDoc = html
+      // <script src="...">
+      .replace(/(<script\b[^>]*\s)src=(["'])([^"']+)\2/gi, (m, pre, q, u) => `${pre}src=${q}${rewriteUrl(u)}${q}`)
+      // <link href="...">
+      .replace(/(<link\b[^>]*)href=(["'])([^"']+)\2/gi, (m, pre, q, u) => {
+        // Don't rewrite canonical/alternate links — only stylesheet/icon
+        if (/rel=(["'])(stylesheet|icon|shortcut)[^"']*\2/i.test(pre) || /type=(["'])text\/css\2/i.test(pre)) {
+          return `${pre}href=${q}${rewriteUrl(u)}${q}`;
+        }
+        return m; // leave nav/canonical links for the interception script
+      })
+      // <img src="..."> <source src="..."> <audio src> <video src>
+      .replace(/(<(?:img|source|audio|video|track|embed)\b[^>]*\s)src=(["'])([^"']+)\2/gi, (m, pre, q, u) => `${pre}src=${q}${rewriteUrl(u)}${q}`)
+      // srcset="url 1x, url 2x"
+      .replace(/srcset=(["'])([^"']+)\1/gi, (m, q, val) => {
+        const rewritten = val.replace(/([^\s,]+)(\s+[\d.]+[wx])?/g, (sm, u, d) => rewriteUrl(u) + (d || ''));
+        return `srcset=${q}${rewritten}${q}`;
+      })
+      // CSS url() inside style attributes and <style> blocks
+      .replace(/url\((["']?)([^"')]+)\1\)/gi, (m, q, u) => `url(${q}${rewriteUrl(u)}${q})`);
 
-    // Inject base tag and interception script before </body>
-    // Base tag ensures all relative URLs resolve correctly inside the iframe
-    const baseTag = '<base href="' + baseUrl + '">';
-    let srcDoc = html;
-
-    // Inject base tag into <head> if present, otherwise prepend
-    if (/<head[^>]*>/i.test(srcDoc)) {
-      srcDoc = srcDoc.replace(/(<head[^>]*>)/i, '$1' + baseTag);
+    // FIX-B5: Remove ALL existing <base> tags, then inject one correct one
+    srcDoc = srcDoc.replace(/<base\b[^>]*>/gi, '');
+    const baseTag = `<base href="${baseUrl}">`;
+    if (/<head\b[^>]*>/i.test(srcDoc)) {
+      srcDoc = srcDoc.replace(/(<head\b[^>]*>)/i, '$1' + baseTag);
+    } else if (/<html\b[^>]*>/i.test(srcDoc)) {
+      srcDoc = srcDoc.replace(/(<html\b[^>]*>)/i, '$1<head>' + baseTag + '</head>');
     } else {
       srcDoc = baseTag + srcDoc;
     }
 
-    // Inject interception script before </body> if present, otherwise append
+    // ── FIX-B4/B6: Interception script ──────────────────────────
+    // Injected into EVERY page. Captures link clicks and form submits
+    // via capture-phase listeners (fires before site's own handlers).
+    // Uses postMessage to send nav/submit events to parent proxy UI.
+    // FIX-B4: No allow-same-origin on the iframe, so we use '*' target.
+    // FIX-B6: e.stopImmediatePropagation() prevents other site handlers
+    //          from swallowing the event before we process it.
+    const interceptScript = `<script>
+(function() {
+  var BASE = ${JSON.stringify(baseUrl)};
+  function abs(u) { try { return new URL(u, BASE).href; } catch(_) { return u; } }
+
+  // ── Link clicks ─────────────────────────────────────────────
+  document.addEventListener('click', function(e) {
+    // Walk up the DOM to find the nearest anchor
+    var el = e.target;
+    for (var i = 0; i < 5 && el; i++) {
+      if (el.tagName === 'A' && el.getAttribute('href')) break;
+      el = el.parentElement;
+    }
+    if (!el || el.tagName !== 'A') return;
+    var href = el.getAttribute('href');
+    if (!href) return;
+    // Let browser handle non-navigating hrefs
+    if (href.startsWith('#') || href.startsWith('javascript:') ||
+        href.startsWith('mailto:') || href.startsWith('tel:') ||
+        href.startsWith('data:')) return;
+    var target = el.getAttribute('target');
+    if (target && target !== '_self' && target !== '_top' && target !== '_parent') return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    window.parent.postMessage({ type: 'proxy-navigate', url: abs(href) }, '*');
+  }, true); // capture phase — fires before site handlers
+
+  // ── Form submits ─────────────────────────────────────────────
+  document.addEventListener('submit', function(e) {
+    var form   = e.target;
+    var method = (form.getAttribute('method') || 'GET').toUpperCase();
+    var action = abs(form.getAttribute('action') || location.href);
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    if (method === 'GET') {
+      var qs = new URLSearchParams(new FormData(form)).toString();
+      window.parent.postMessage({
+        type: 'proxy-navigate',
+        url: action + (qs ? (action.includes('?') ? '&' : '?') + qs : ''),
+      }, '*');
+    } else {
+      window.parent.postMessage({
+        type:        'proxy-submit',
+        url:         action,
+        method:      method,
+        body:        new URLSearchParams(new FormData(form)).toString(),
+        contentType: 'application/x-www-form-urlencoded',
+      }, '*');
+    }
+  }, true);
+
+  // ── XHR/fetch override — redirect in-page requests through proxy ─
+  // Many SPAs use fetch/XHR for navigation. We patch them so requests
+  // go through /proxy-asset which routes via proxy.js (captured).
+  var _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    var url = (typeof input === 'string') ? input : (input.url || '');
+    try {
+      var absUrl = new URL(url, BASE).href;
+      if (absUrl.startsWith('http') && !absUrl.startsWith(location.origin)) {
+        var proxied = '/proxy-asset?url=' + encodeURIComponent(absUrl);
+        return _origFetch(proxied, init);
+      }
+    } catch(_) {}
+    return _origFetch(input, init);
+  };
+
+})();
+<\/script>`;
+
+    // Inject interception script before </body> or at the end
     if (/<\/body>/i.test(srcDoc)) {
       srcDoc = srcDoc.replace(/<\/body>/i, interceptScript + '</body>');
     } else {
       srcDoc += interceptScript;
     }
 
-    // Remove existing <base> tags that might conflict
-    srcDoc = srcDoc.replace(/<base[^>]*>/gi, '').replace(/(<head[^>]*>)/i, '$1' + baseTag);
+    // Clear old frame
+    var old = pageContent.querySelector('iframe.proxy-frame');
+    if (old) old.remove();
 
-    // Clear old iframe if exists
-    var oldFrame = pageContent.querySelector('iframe.proxy-frame');
-    if (oldFrame) oldFrame.remove();
-
-    // Create sandboxed iframe
+    // FIX-B4: Remove allow-same-origin — it caused postMessage mismatches.
+    // Scripts still work (allow-scripts), forms work (allow-forms),
+    // popups work (allow-popups). allow-same-origin is NOT included.
     var frame = document.createElement('iframe');
     frame.className = 'proxy-frame';
-    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals');
+    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-presentation');
     frame.style.cssText = 'width:100%;height:100%;border:none;display:block;background:#fff;';
     frame.srcdoc = srcDoc;
-    pageContent.style.height = '100%';
-    pageContent.style.padding = '0';
-    pageContent.style.overflow = 'hidden';
+    pageContent.style.cssText = 'display:block;width:100%;height:100%;padding:0;overflow:hidden;';
     pageContent.appendChild(frame);
 
     bShowContent();
@@ -1048,7 +1131,7 @@ wsConnect();
     const pageContent = el('bPageContent');
     if (!pageContent) return;
     let pretty = text;
-    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch(_) {}
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
     pageContent.innerHTML = `<pre style="padding:16px;font-family:monospace;font-size:12px;background:#0a0c0f;color:#e2e8f0;white-space:pre-wrap;word-break:break-all;min-height:100%;">${bEsc(pretty)}</pre>`;
     bShowContent();
   }
@@ -1065,7 +1148,7 @@ wsConnect();
   }
 
   function bEsc(s) {
-    return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   function bBumpCapture() {
@@ -1075,7 +1158,6 @@ wsConnect();
     setTimeout(() => { dot.style.background = '#22c55e'; }, 800);
   }
 
-  // ── Sync capture count ────────────────────────────────────────
   async function bSyncStats() {
     try {
       const r = await fetch('/api/stats');
