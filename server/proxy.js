@@ -70,14 +70,17 @@ function sendJSON(res, data, status=200) {
 }
 
 // ── Forward a plain HTTP request to origin ───────────────────
-function forwardHTTP(reqObj, clientRes) {
+// FIX Bug 1: Returns the full response so match-replace can be
+// applied BEFORE writing anything to the client.
+// The caller is responsible for writing to clientRes.
+function forwardHTTP(reqObj) {
   return new Promise(resolve => {
     const parsed  = new URL(reqObj.url);
     const isHTTPS = parsed.protocol === 'https:';
     const lib     = isHTTPS ? https : http;
     const opts = {
       hostname: parsed.hostname,
-      port:     parsed.port || (isHTTPS?443:80),
+      port:     parsed.port || (isHTTPS ? 443 : 80),
       path:     (parsed.pathname || '/') + (parsed.search || ''),
       method:   reqObj.method,
       headers:  { ...reqObj.headers },
@@ -99,25 +102,39 @@ function forwardHTTP(reqObj, clientRes) {
         delete rh['content-encoding'];
         rh['content-length'] = String(buf.length);
 
-        // stream to client
-        try { clientRes.writeHead(originRes.statusCode, rh); clientRes.end(buf); } catch(_){}
-
-        resolve({ status:originRes.statusCode, headers:rh, body, latency_ms:Date.now()-t0 });
+        resolve({
+          status:     originRes.statusCode,
+          headers:    rh,
+          body,
+          buf,          // raw bytes — used to write to client
+          latency_ms: Date.now()-t0,
+        });
       });
     });
     req.on('error', e => {
-      try { clientRes.writeHead(502); clientRes.end(`Séç Proxy upstream error: ${e.message}`); } catch(_){}
-      resolve({ status:502, headers:{}, body:e.message, latency_ms:Date.now()-t0 });
+      resolve({ status:502, headers:{}, body:e.message, buf:Buffer.from(e.message), latency_ms:Date.now()-t0 });
     });
     if (reqObj.body) req.write(reqObj.body);
     req.end();
   });
 }
 
+// ── Write a resolved response object to the client socket ────
+function sendResponse(clientRes, resObj) {
+  try {
+    // Rebuild content-length from the actual buf if present
+    const headers = { ...resObj.headers };
+    if (resObj.buf) headers['content-length'] = String(resObj.buf.length);
+    clientRes.writeHead(resObj.status, headers);
+    clientRes.end(resObj.buf || Buffer.from(resObj.body || ''));
+  } catch (_) {}
+}
+
 // ── REST API ─────────────────────────────────────────────────
 async function handleAPI(pathname, method, bodyStr, res) {
-  // CORS preflight
-  if (method==='OPTIONS') { res.writeHead(204, corsHeaders()); res.end(); return; }
+  // FIX Bug 4: CORS preflight is no longer handled here (duplicate);
+  // it is handled once at the top of the main server handler ONLY
+  // for actual /api/* paths — proxy traffic OPTIONS is forwarded normally.
 
   let body={};
   try { body = JSON.parse(bodyStr||'{}'); } catch(_){}
@@ -125,7 +142,7 @@ async function handleAPI(pathname, method, bodyStr, res) {
   // ── Requests ──
   if (method==='GET'  && pathname==='/api/requests') return sendJSON(res, db.list(1000));
   if (method==='GET'  && /^\/api\/requests\/\d+$/.test(pathname)) {
-    const id=parseInt(pathname.split('/')[3]);
+    const id=parseInt(pathname.split('/')[3], 10);
     const r=db.getById(id);
     if (!r) return sendJSON(res,{error:'not found'},404);
     return sendJSON(res, { ...r, scanner_hits:db.hitsFor(id) });
@@ -187,17 +204,17 @@ async function handleAPI(pathname, method, bodyStr, res) {
   // ── Intercept rules ──
   if (method==='GET'  && pathname==='/api/rules')                              return sendJSON(res,db.listRules());
   if (method==='POST' && pathname==='/api/rules')                              { db.addRule(body); return sendJSON(res,{ok:true}); }
-  if (method==='DELETE' && /^\/api\/rules\/\d+$/.test(pathname))              { db.deleteRule(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/rules\/\d+$/.test(pathname))              { db.deleteRule(parseInt(pathname.split('/')[3], 10)); return sendJSON(res,{ok:true}); }
 
   // ── Match-replace rules ──
   if (method==='GET'  && pathname==='/api/mr-rules')                          return sendJSON(res,db.listMR());
   if (method==='POST' && pathname==='/api/mr-rules')                          { db.addMR(body); return sendJSON(res,{ok:true}); }
-  if (method==='DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))          { db.deleteMR(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))          { db.deleteMR(parseInt(pathname.split('/')[3], 10)); return sendJSON(res,{ok:true}); }
 
   // ── Saved requests ──
   if (method==='GET'  && pathname==='/api/saved')                             return sendJSON(res,db.listSaved());
   if (method==='POST' && pathname==='/api/saved')                             { db.saveRequest(body); return sendJSON(res,{ok:true}); }
-  if (method==='DELETE' && /^\/api\/saved\/\d+$/.test(pathname))             { db.deleteSaved(parseInt(pathname.split('/')[3])); return sendJSON(res,{ok:true}); }
+  if (method==='DELETE' && /^\/api\/saved\/\d+$/.test(pathname))             { db.deleteSaved(parseInt(pathname.split('/')[3], 10)); return sendJSON(res,{ok:true}); }
 
   // ── Stats ──
   if (method==='GET' && pathname==='/api/stats') return sendJSON(res,{ ...stats, uptime:Date.now()-stats.startedAt });
@@ -226,8 +243,9 @@ const server = http.createServer(async (clientReq, clientRes) => {
   // Absorb any socket errors on this connection
   clientReq.socket.on('error', () => {});
 
-  // CORS preflight to API
-  if (clientReq.method === 'OPTIONS') {
+  // FIX Bug 4: Only intercept OPTIONS for /api/* paths.
+  // OPTIONS requests to proxy targets must be forwarded, not absorbed.
+  if (clientReq.method === 'OPTIONS' && reqUrl.startsWith('/api/')) {
     clientRes.writeHead(204, corsHeaders()); clientRes.end(); return;
   }
 
@@ -242,15 +260,20 @@ const server = http.createServer(async (clientReq, clientRes) => {
   const fullReqUrl = reqUrl.startsWith('http') ? reqUrl : `http://${clientReq.headers['host']||'localhost'}${reqUrl}`;
   let parsed;
   try { parsed = new URL(fullReqUrl); } catch(_) { parsed = new URL('http://localhost' + reqUrl); }
+
+  // FIX Bug 3: Detect scheme correctly from the URL, not hardcode 'http'.
+  const scheme = parsed.protocol === 'https:' ? 'https' : 'http';
   const host   = parsed.hostname || (clientReq.headers['host']||'').split(':')[0];
-  const port   = parseInt(parsed.port||80);
+  // FIX Bug 3: Parse port properly with radix; default by scheme.
+  const port   = parsed.port ? parseInt(parsed.port, 10) : (scheme === 'https' ? 443 : 80);
+
   const bodyBuf= await collectBody(clientReq);
   const bodyStr= bodyBuf.length ? bodyBuf.toString('utf8') : '';
   const headers= {};
   for (const [k,v] of Object.entries(clientReq.headers)) headers[k]=v;
 
   let reqObj = {
-    method: clientReq.method, scheme:'http', host, port,
+    method: clientReq.method, scheme, host, port,
     path: (parsed.pathname||'/') + (parsed.search||''),
     url: fullReqUrl,
     headers, body:bodyStr,
@@ -263,9 +286,10 @@ const server = http.createServer(async (clientReq, clientRes) => {
   let finalReq = reqObj;
   try {
     const r = await intercept.pause(reqObj);
+    // FIX Bug 5: Drop should close the connection with 502, not 200.
     if (r.action==='drop') {
       stats.intercepted++;
-      clientRes.writeHead(200); clientRes.end('Dropped by Séç Proxy.');
+      try { clientRes.writeHead(502); clientRes.end('Request dropped by Séç Proxy.'); } catch(_){}
       return;
     }
     finalReq = r.request;
@@ -276,16 +300,33 @@ const server = http.createServer(async (clientReq, clientRes) => {
   const reqId = db.insertRequest(finalReq);
   bridge.emitRequest({ id:reqId, ...finalReq, req_headers:finalReq.headers, req_body:finalReq.body });
 
-  // Forward
-  const resObj = await forwardHTTP(finalReq, clientRes);
+  // FIX Bug 1: Fetch the response first, apply match-replace, THEN send to client.
+  const resObj = await forwardHTTP(finalReq);
 
-  // Match-replace on response
+  if (resObj.status === 502 && !resObj.buf.length) {
+    stats.errors++;
+    try { clientRes.writeHead(502); clientRes.end(`Séç Proxy upstream error: ${resObj.body}`); } catch(_){}
+  }
+
+  // Apply match-replace on response BEFORE sending to client
   const modRes = intercept.applyMR(resObj, 'response');
+
+  // Rebuild buf from modified body if body was changed by match-replace
+  const modBuf = modRes.buf && modRes.body === resObj.body
+    ? modRes.buf
+    : Buffer.from(modRes.body || '');
+  modRes.buf = modBuf;
+  modRes.headers = { ...modRes.headers, 'content-length': String(modBuf.length) };
+
+  // Now send the (potentially modified) response to the client
+  sendResponse(clientRes, modRes);
 
   // Store response
   db.updateResponse(reqId, modRes);
-  stats.bytesOut += (finalReq.body||'').length;
-  stats.bytesIn  += (modRes.body||'').length;
+
+  // FIX Bug 2: Use Buffer.byteLength for accurate byte counts.
+  stats.bytesOut += Buffer.byteLength(finalReq.body || '', 'utf8');
+  stats.bytesIn  += modBuf.length;
 
   // Passive scan
   const full = db.getById(reqId);
@@ -303,7 +344,7 @@ const server = http.createServer(async (clientReq, clientRes) => {
 server.on('connect', (req, socket, head) => {
   stats.total++;
   const [hostname, portStr='443'] = (req.url||'').split(':');
-  mitm.handleConnect(socket, hostname, parseInt(portStr));
+  mitm.handleConnect(socket, hostname, parseInt(portStr, 10));
 });
 
 // ── Wire intercept events → WS ───────────────────────────────
