@@ -1,17 +1,25 @@
 /* ============================================================
    server/intercept.js — Intercept engine (singleton)
    Séç Proxy v2.0
+
+   FIX Bug 15: Paused requests now time out after INTERCEPT_TTL ms
+   (default 2 minutes). Timed-out requests are automatically
+   forwarded as-is so the browser doesn't hang forever and memory
+   is not leaked. A 'timeout' event is emitted for the UI to
+   remove the entry from the pending list.
    ============================================================ */
 'use strict';
 
 const EventEmitter = require('events');
 const db           = require('./db');
 
+const INTERCEPT_TTL = parseInt(process.env.INTERCEPT_TTL || '120000', 10); // 2 minutes
+
 class InterceptEngine extends EventEmitter {
   constructor() {
     super();
     this.enabled = false;
-    this.queue   = new Map();  // id → { request, resolve, reject, ts }
+    this.queue   = new Map();  // id → { request, resolve, ts, timer }
     this._seq    = 0;
   }
 
@@ -82,14 +90,24 @@ class InterceptEngine extends EventEmitter {
     }
   }
 
-  // ── Pause until forwarded/dropped ─────────────────────────
+  // ── FIX Bug 15: Pause with TTL timeout ────────────────────
   pause(reqObj) {
     if (!this.enabled || !this._matches(reqObj)) {
       return Promise.resolve({ action:'forward', request:reqObj });
     }
     const id = ++this._seq;
     return new Promise((resolve) => {
-      this.queue.set(id, { request:reqObj, resolve, ts:Date.now() });
+      // Auto-forward after TTL so the browser doesn't hang forever.
+      const timer = setTimeout(() => {
+        if (!this.queue.has(id)) return;
+        this.queue.delete(id);
+        console.warn(`[Intercept] Request #${id} timed out after ${INTERCEPT_TTL}ms — auto-forwarding.`);
+        this.emit('timeout', { id });
+        this.emit('forwarded', { id });
+        resolve({ action:'forward', request:reqObj });
+      }, INTERCEPT_TTL);
+
+      this.queue.set(id, { request:reqObj, resolve, ts:Date.now(), timer });
       this.emit('paused', { id, request:reqObj });
     });
   }
@@ -97,6 +115,7 @@ class InterceptEngine extends EventEmitter {
   forward(id, modified) {
     const e = this.queue.get(id);
     if (!e) return false;
+    clearTimeout(e.timer);
     this.queue.delete(id);
     e.resolve({ action:'forward', request: modified || e.request });
     this.emit('forwarded', { id });
@@ -106,6 +125,7 @@ class InterceptEngine extends EventEmitter {
   drop(id) {
     const e = this.queue.get(id);
     if (!e) return false;
+    clearTimeout(e.timer);
     this.queue.delete(id);
     e.resolve({ action:'drop' });
     this.emit('dropped', { id });
@@ -114,6 +134,7 @@ class InterceptEngine extends EventEmitter {
 
   forwardAll() {
     for (const [id, e] of this.queue) {
+      clearTimeout(e.timer);
       e.resolve({ action:'forward', request:e.request });
       this.emit('forwarded', { id });
     }
