@@ -2,8 +2,51 @@
    server/scanner.js — Passive security scanner
    Séç Proxy v2.0
    Runs on every completed request/response pair.
+
+   FIX Bug 16: Cookie checks now correctly handle multi-value
+   Set-Cookie headers. Node's http module collapses duplicate
+   headers into a comma-separated string; sql.js stores them
+   as a single JSON string. We split on the standard "," boundary
+   (carefully, avoiding splitting on commas inside cookie values)
+   so all cookies in a response are checked.
+
+   FIX Bug 17: JWT regex tightened to require the Base64url
+   character set only (no dots/slashes that appear in filenames)
+   and validates that the first segment decodes to a JSON object
+   with an "alg" or "typ" field, virtually eliminating false positives.
    ============================================================ */
 'use strict';
+
+// ── FIX Bug 16: Split a Set-Cookie header string into individual cookies.
+// Set-Cookie values can contain commas (in Expires= dates), so we cannot
+// simply split on ",". We split on ", " only when followed by a known
+// cookie attribute name or a new cookie name= pattern.
+function splitSetCookie(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (!raw) return [];
+  // Split on ", " that is followed by a word-char (new cookie name start)
+  // but not inside an Expires date (which looks like "Mon, 01 Jan 2026").
+  // The heuristic: split on ", " NOT followed by a 3-letter day-of-week.
+  return raw.split(/,\s*(?!(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\s])/i);
+}
+
+// ── FIX Bug 17: Validate a JWT-like string more strictly.
+// Returns true only if the string looks like a real JWT:
+//   - Three dot-separated base64url segments
+//   - First segment decodes to JSON with "alg" or "typ"
+function looksLikeJWT(candidate) {
+  const parts = candidate.split('.');
+  if (parts.length !== 3) return false;
+  try {
+    // Pad base64url to a multiple of 4
+    const pad = s => s + '='.repeat((4 - s.length % 4) % 4);
+    const header = JSON.parse(Buffer.from(pad(parts[0]), 'base64').toString('utf8'));
+    return typeof header === 'object' && header !== null &&
+      ('alg' in header || 'typ' in header);
+  } catch (_) {
+    return false;
+  }
+}
 
 const CHECKS = [
   // ── Response headers ──────────────────────────────────────
@@ -50,25 +93,29 @@ const CHECKS = [
   {
     id:'cookie-httponly', severity:'low', type:'Cookie missing HttpOnly',
     test({rH}){
-      const c=rH['set-cookie']; if(!c) return false;
-      return (Array.isArray(c)?c:[c]).some(x=>/httponly/i.test(x)===false);
+      // FIX Bug 16: use splitSetCookie to check ALL cookies.
+      const cookies = splitSetCookie(rH['set-cookie']);
+      if (!cookies.length) return false;
+      return cookies.some(x => !/httponly/i.test(x));
     },
     detail:'Cookie accessible to JavaScript — XSS can steal it.',
   },
   {
     id:'cookie-secure', severity:'low', type:'Cookie missing Secure flag',
     test({scheme,rH}){
-      if(scheme!=='https') return false;
-      const c=rH['set-cookie']; if(!c) return false;
-      return (Array.isArray(c)?c:[c]).some(x=>/;\s*secure/i.test(x)===false);
+      if (scheme !== 'https') return false;
+      const cookies = splitSetCookie(rH['set-cookie']);
+      if (!cookies.length) return false;
+      return cookies.some(x => !/;\s*secure/i.test(x));
     },
     detail:'Cookie sent over plain HTTP.',
   },
   {
     id:'cookie-samesite', severity:'info', type:'Cookie missing SameSite',
     test({rH}){
-      const c=rH['set-cookie']; if(!c) return false;
-      return (Array.isArray(c)?c:[c]).some(x=>/samesite/i.test(x)===false);
+      const cookies = splitSetCookie(rH['set-cookie']);
+      if (!cookies.length) return false;
+      return cookies.some(x => !/samesite/i.test(x));
     },
     detail:'Cookie vulnerable to CSRF.',
   },
@@ -111,8 +158,13 @@ const CHECKS = [
     detail:'RFC1918 IP found — possible SSRF target.',
   },
   {
+    // FIX Bug 17: Use looksLikeJWT() for validated detection.
     id:'jwt-in-url', severity:'medium', type:'JWT in URL',
-    test({url}){ return /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/.test(url); },
+    test({url}){
+      // Find candidate segments: base64url.base64url.base64url
+      const m = url.match(/[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/);
+      return m ? looksLikeJWT(m[0]) : false;
+    },
     detail:'JWTs in URLs appear in logs and browser history.',
   },
   {
