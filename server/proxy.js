@@ -2,7 +2,22 @@
    server/proxy.js — Main proxy server + REST API
    Séç Proxy v2.0
 
-   
+   Ports:
+     PROXY_PORT (default 8080) — HTTP forward proxy + REST API
+     WS_PORT    (default 8081) — WebSocket bridge to UI
+
+   All previous fixes retained. Additional runtime fixes:
+   FIX-R4: Garbled/binary response in browser — compressed bodies
+            (gzip, deflate, brotli) were not being decompressed in
+            the 'close' path of forwardRaw(). Many servers close the
+            TCP connection without a FIN so only 'close' fires, never
+            'end'. Unified both paths into a single async processRaw()
+            function that always decompresses regardless of which
+            socket event triggers settlement.
+   FIX-R5: Also tell the origin we accept all encodings by forwarding
+            'accept-encoding' but handle the decompression ourselves,
+            so we don't accidentally request no-encoding when the
+            browser sent its own accept-encoding.
    ============================================================ */
 'use strict';
 
@@ -38,15 +53,18 @@ const STATUS_PHRASES = {
 };
 function reasonPhrase(s) { return STATUS_PHRASES[s] || 'Unknown'; }
 
-// ── Helpers ──────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────
+// FIX-R4: Decompress returns a Promise always. On failure returns
+// the original buffer so the caller always gets something usable.
 function decompress(buf, enc) {
-  return new Promise(res => {
-    if (!enc) return res(buf);
+  return new Promise(resolve => {
+    if (!enc || !buf.length) return resolve(buf);
     const e = enc.toLowerCase();
-    if (e.includes('gzip'))         zlib.gunzip(buf,            (er,r) => res(er ? buf : r));
-    else if (e.includes('deflate')) zlib.inflate(buf,           (er,r) => res(er ? buf : r));
-    else if (e.includes('br'))      zlib.brotliDecompress(buf,  (er,r) => res(er ? buf : r));
-    else res(buf);
+    const cb = (err, result) => resolve(err ? buf : result);
+    if      (e.includes('br'))      zlib.brotliDecompress(buf, cb);
+    else if (e.includes('gzip'))    zlib.gunzip(buf,            cb);
+    else if (e.includes('deflate')) zlib.inflate(buf,           cb);
+    else resolve(buf);
   });
 }
 
@@ -81,7 +99,7 @@ function sendJSON(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-// ── Decode chunked body ───────────────────────────────────────
+// ── Decode chunked transfer-encoded body ─────────────────────
 function decodeChunked(buf) {
   const parts = [];
   let pos = 0;
@@ -100,12 +118,12 @@ function decodeChunked(buf) {
 
 // ── Parse a raw HTTP response buffer ─────────────────────────
 // Does NOT use Node's http parser — safe against Content-Length +
-// Transfer-Encoding dual-header responses (FIX-R1).
+// Transfer-Encoding dual-header responses.
 function parseRawResponse(buf) {
   const raw = buf.toString('binary');
   const sep = raw.indexOf('\r\n\r\n');
   if (sep < 0) {
-    return { status: 502, statusText: 'Bad Gateway', headers: {}, bodyBuf: buf, body: buf.toString('utf8') };
+    return { status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:buf, encoding:'' };
   }
 
   const head  = raw.slice(0, sep);
@@ -121,29 +139,77 @@ function parseRawResponse(buf) {
     const key = lines[i].slice(0, c).trim().toLowerCase();
     const val = lines[i].slice(c + 1).trim();
     if (headers[key] !== undefined) {
-      headers[key] = Array.isArray(headers[key])
-        ? [...headers[key], val]
-        : [headers[key], val];
+      headers[key] = Array.isArray(headers[key]) ? [...headers[key], val] : [headers[key], val];
     } else {
       headers[key] = val;
     }
   }
 
+  // Decode chunked framing first, then we'll decompress separately
   const isChunked = (headers['transfer-encoding'] || '').toLowerCase().includes('chunked');
   let bodyBuf = buf.slice(sep + 4);
   if (isChunked) bodyBuf = decodeChunked(bodyBuf);
 
-  return { status, statusText, headers, bodyBuf, body: bodyBuf.toString('utf8') };
+  // Pull out content-encoding before stripping headers
+  const encoding = headers['content-encoding'] || '';
+
+  return { status, statusText, headers, bodyBuf, encoding };
 }
 
-// ── FIX-R1: Raw socket HTTP/HTTPS forward ────────────────────
-// Bypasses Node's http/https.request() parser entirely so servers
-// that send both Content-Length and Transfer-Encoding don't crash us.
+// ── FIX-R4: Unified async response processor ─────────────────
+// Called from both 'end' and 'close' socket events. Decompresses
+// the body and strips conflicting headers before resolving.
+async function processRawResponse(rawBuf, t0) {
+  let parsed;
+  try {
+    parsed = parseRawResponse(rawBuf);
+  } catch (_) {
+    return {
+      status: 502, statusText: 'Bad Gateway', headers: {},
+      bodyBuf: rawBuf, body: '', latency_ms: Date.now() - t0,
+    };
+  }
+
+  // FIX-R4: Always decompress — whether we got here via 'end' or 'close'
+  let bodyBuf = parsed.bodyBuf;
+  if (parsed.encoding) {
+    try {
+      bodyBuf = await decompress(parsed.bodyBuf, parsed.encoding);
+    } catch (_) {
+      // decompression failed — send raw, browser may handle it
+      bodyBuf = parsed.bodyBuf;
+    }
+  }
+
+  const body = bodyBuf.toString('utf8');
+
+  // Clean up headers: remove encoding/framing headers, set correct length
+  const headers = { ...parsed.headers };
+  delete headers['content-encoding'];
+  delete headers['transfer-encoding'];
+  headers['content-length'] = String(bodyBuf.length);
+
+  return {
+    status:     parsed.status,
+    statusText: parsed.statusText,
+    headers,
+    bodyBuf,
+    body,
+    latency_ms: Date.now() - t0,
+  };
+}
+
+// ── Raw socket HTTP/HTTPS forward ────────────────────────────
+// Bypasses Node's http/https.request() parser so servers that send
+// both Content-Length and Transfer-Encoding don't crash us.
 function forwardRaw(reqObj) {
   return new Promise(resolve => {
     let parsed;
     try { parsed = new URL(reqObj.url); } catch (_) {
-      return resolve({ status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:Buffer.alloc(0), body:'Invalid URL', latency_ms:0 });
+      return resolve({
+        status:502, statusText:'Bad Gateway', headers:{},
+        bodyBuf:Buffer.alloc(0), body:'Invalid URL', latency_ms:0,
+      });
     }
 
     const isHTTPS = parsed.protocol === 'https:';
@@ -152,7 +218,7 @@ function forwardRaw(reqObj) {
     const path    = (parsed.pathname || '/') + (parsed.search || '');
     const t0      = Date.now();
 
-    // Build request headers — strip proxy-specific headers
+    // Build request — strip proxy-only headers
     const fwdHeaders = { ...reqObj.headers };
     delete fwdHeaders['proxy-connection'];
     delete fwdHeaders['proxy-authorization'];
@@ -160,6 +226,8 @@ function forwardRaw(reqObj) {
     delete fwdHeaders['trailers'];
     fwdHeaders['host']       = host;
     fwdHeaders['connection'] = 'close';
+    // FIX-R5: Tell origin we can handle any encoding — we decompress ourselves
+    fwdHeaders['accept-encoding'] = 'gzip, deflate, br';
 
     const hlines      = Object.entries(fwdHeaders).map(([k, v]) => `${k}: ${v}`).join('\r\n');
     const requestLine = `${reqObj.method} ${path} HTTP/1.1`;
@@ -172,14 +240,21 @@ function forwardRaw(reqObj) {
     const resBufs = [];
     let settled   = false;
 
-    function settle(result) {
+    // FIX-R4: Single async settlement function used by both 'end' and 'close'
+    async function settle(rawBuf, errorResult) {
       if (settled) return;
       settled = true;
       try { sock.destroy(); } catch (_) {}
-      resolve({ ...result, latency_ms: Date.now() - t0 });
+
+      if (errorResult) {
+        resolve({ ...errorResult, latency_ms: Date.now() - t0 });
+        return;
+      }
+      // Always run through processRawResponse — handles decompression
+      const result = await processRawResponse(rawBuf, t0);
+      resolve(result);
     }
 
-    // Open raw socket — net for HTTP, tls for HTTPS
     const sock = isHTTPS
       ? tls.connect({ host, port, servername: host, rejectUnauthorized: false })
       : net.connect({ host, port });
@@ -187,72 +262,49 @@ function forwardRaw(reqObj) {
     sock.setMaxListeners(20);
     sock.setTimeout(30000);
 
-    sock.once('timeout', () =>
-      settle({ status:504, statusText:'Gateway Timeout', headers:{}, bodyBuf:Buffer.alloc(0), body:'Upstream timeout' })
-    );
-    sock.once('error', e =>
-      settle({ status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:Buffer.alloc(0), body: e.message })
-    );
+    sock.once('timeout', () => settle(null, {
+      status:504, statusText:'Gateway Timeout', headers:{},
+      bodyBuf:Buffer.alloc(0), body:'Upstream timeout',
+    }));
 
-    // Write request once connected (net fires 'connect', tls fires 'secureConnect')
+    sock.once('error', e => settle(null, {
+      status:502, statusText:'Bad Gateway', headers:{},
+      bodyBuf:Buffer.alloc(0), body: e.message,
+    }));
+
     const onConnect = () => { try { sock.write(rawReqBuf); } catch (_) {} };
     if (isHTTPS) sock.once('secureConnect', onConnect);
     else         sock.once('connect',       onConnect);
 
     sock.on('data', chunk => resBufs.push(chunk));
 
+    // FIX-R4: Both 'end' and 'close' call the same settle() path.
+    // 'end' = server sent FIN (clean close). 'close' = connection dropped
+    // (common with many real servers). Both settle with the full buffer.
     sock.once('end', () => {
-      const raw = Buffer.concat(resBufs);
-      let res = { status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:Buffer.alloc(0), body:'' };
-      try {
-        res = parseRawResponse(raw);
-        // Decompress if needed — synchronous-style via callback chain
-        const enc = res.headers['content-encoding'] || '';
-        if (enc) {
-          decompress(res.bodyBuf, enc).then(decompressed => {
-            res.bodyBuf = decompressed;
-            res.body    = decompressed.toString('utf8');
-            // Strip encoding headers — body is now raw
-            delete res.headers['content-encoding'];
-            delete res.headers['transfer-encoding'];
-            res.headers['content-length'] = String(decompressed.length);
-            settle(res);
-          });
-          return; // settle called inside .then()
-        }
-        // No compression — strip conflicting headers, set content-length
-        delete res.headers['content-encoding'];
-        delete res.headers['transfer-encoding'];
-        res.headers['content-length'] = String(res.bodyBuf.length);
-      } catch (_) {}
-      settle(res);
+      settle(Buffer.concat(resBufs));
     });
 
     sock.once('close', () => {
       if (!settled) {
-        if (resBufs.length) {
-          const raw = Buffer.concat(resBufs);
-          let res = { status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:Buffer.alloc(0), body:'' };
-          try {
-            res = parseRawResponse(raw);
-            delete res.headers['content-encoding'];
-            delete res.headers['transfer-encoding'];
-            res.headers['content-length'] = String(res.bodyBuf.length);
-          } catch (_) {}
-          settle(res);
+        const raw = Buffer.concat(resBufs);
+        if (raw.length) {
+          settle(raw);
         } else {
-          settle({ status:502, statusText:'Bad Gateway', headers:{}, bodyBuf:Buffer.alloc(0), body:'Connection closed' });
+          settle(null, {
+            status:502, statusText:'Bad Gateway', headers:{},
+            bodyBuf:Buffer.alloc(0), body:'Connection closed with no data',
+          });
         }
       }
     });
   });
 }
 
-// ── Write a resolved response to the Node HTTP client socket ─
+// ── Write a resolved response to the client ──────────────────
 function sendResponse(clientRes, resObj) {
   try {
     const headers = { ...resObj.headers };
-    // Always set definitive content-length; strip conflicting headers
     delete headers['transfer-encoding'];
     const body = resObj.bodyBuf instanceof Buffer ? resObj.bodyBuf : Buffer.from(resObj.body || '');
     headers['content-length'] = String(body.length);
@@ -261,7 +313,7 @@ function sendResponse(clientRes, resObj) {
   } catch (_) {}
 }
 
-// ── REST API ─────────────────────────────────────────────────
+// ── REST API ──────────────────────────────────────────────────
 async function handleAPI(pathname, method, bodyStr, res) {
   let body = {};
   try { body = JSON.parse(bodyStr || '{}'); } catch (_) {}
@@ -277,7 +329,7 @@ async function handleAPI(pathname, method, bodyStr, res) {
   if (method === 'POST' && pathname === '/api/requests/clear') { db.clearAll(); return sendJSON(res, { ok:true }); }
   if (method === 'POST' && pathname === '/api/search')          return sendJSON(res, db.search(body.q || ''));
 
-  // ── Repeater — FIX-R3: use forwardRaw() not http.request() ──
+  // ── Repeater ──
   if (method === 'POST' && pathname === '/api/repeat') {
     const { method:m, url:u, headers:h = {}, body:b } = body;
     if (!u) return sendJSON(res, { error:'url required' }, 400);
@@ -320,19 +372,19 @@ async function handleAPI(pathname, method, bodyStr, res) {
   }
 
   // ── Intercept rules ──
-  if (method === 'GET'    && pathname === '/api/rules')                        return sendJSON(res, db.listRules());
-  if (method === 'POST'   && pathname === '/api/rules')                        { db.addRule(body); return sendJSON(res, { ok:true }); }
-  if (method === 'DELETE' && /^\/api\/rules\/\d+$/.test(pathname))            { db.deleteRule(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
+  if (method === 'GET'    && pathname === '/api/rules')                   return sendJSON(res, db.listRules());
+  if (method === 'POST'   && pathname === '/api/rules')                   { db.addRule(body); return sendJSON(res, { ok:true }); }
+  if (method === 'DELETE' && /^\/api\/rules\/\d+$/.test(pathname))       { db.deleteRule(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
 
   // ── Match-replace rules ──
-  if (method === 'GET'    && pathname === '/api/mr-rules')                     return sendJSON(res, db.listMR());
-  if (method === 'POST'   && pathname === '/api/mr-rules')                     { db.addMR(body); return sendJSON(res, { ok:true }); }
-  if (method === 'DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))         { db.deleteMR(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
+  if (method === 'GET'    && pathname === '/api/mr-rules')                return sendJSON(res, db.listMR());
+  if (method === 'POST'   && pathname === '/api/mr-rules')                { db.addMR(body); return sendJSON(res, { ok:true }); }
+  if (method === 'DELETE' && /^\/api\/mr-rules\/\d+$/.test(pathname))    { db.deleteMR(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
 
   // ── Saved requests ──
-  if (method === 'GET'    && pathname === '/api/saved')                        return sendJSON(res, db.listSaved());
-  if (method === 'POST'   && pathname === '/api/saved')                        { db.saveRequest(body); return sendJSON(res, { ok:true }); }
-  if (method === 'DELETE' && /^\/api\/saved\/\d+$/.test(pathname))            { db.deleteSaved(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
+  if (method === 'GET'    && pathname === '/api/saved')                   return sendJSON(res, db.listSaved());
+  if (method === 'POST'   && pathname === '/api/saved')                   { db.saveRequest(body); return sendJSON(res, { ok:true }); }
+  if (method === 'DELETE' && /^\/api\/saved\/\d+$/.test(pathname))       { db.deleteSaved(parseInt(pathname.split('/')[3], 10)); return sendJSON(res, { ok:true }); }
 
   // ── Stats ──
   if (method === 'GET' && pathname === '/api/stats')
@@ -358,7 +410,7 @@ async function handleAPI(pathname, method, bodyStr, res) {
   sendJSON(res, { error:'not found' }, 404);
 }
 
-// ── Main server ──────────────────────────────────────────────
+// ── Main server ───────────────────────────────────────────────
 const server = http.createServer(async (clientReq, clientRes) => {
   const reqUrl = clientReq.url || '/';
 
@@ -431,31 +483,33 @@ const server = http.createServer(async (clientReq, clientRes) => {
   const reqId = db.insertRequest(finalReq);
   bridge.emitRequest({ id:reqId, ...finalReq, req_headers:finalReq.headers, req_body:finalReq.body });
 
-  // FIX-R1: Use raw socket forward — safe against dual Content-Length +
-  // Transfer-Encoding headers that Node's http parser rejects.
+  // Forward using raw socket — safe against dual Content-Length + TE headers
   const resObj = await forwardRaw(finalReq);
 
-  if (resObj.status === 502) stats.errors++;
+  if (resObj.status >= 500) stats.errors++;
 
   // Apply match-replace on response BEFORE sending to client
-  const modRes    = intercept.applyMR(resObj, 'response');
-  const modBuf    = modRes.bodyBuf instanceof Buffer && modRes.body === resObj.body
+  const modRes   = intercept.applyMR(resObj, 'response');
+  const modBuf   = modRes.bodyBuf instanceof Buffer && modRes.body === resObj.body
     ? modRes.bodyBuf
     : Buffer.from(modRes.body || '');
-  modRes.bodyBuf  = modBuf;
-  modRes.headers  = { ...modRes.headers, 'content-length': String(modBuf.length) };
+  modRes.bodyBuf = modBuf;
+  modRes.headers = { ...modRes.headers, 'content-length': String(modBuf.length) };
   delete modRes.headers['transfer-encoding'];
+  delete modRes.headers['content-encoding'];
 
-  // Send to client
   sendResponse(clientRes, modRes);
 
-  // Store response
-  db.updateResponse(reqId, { status: modRes.status, headers: modRes.headers, body: modRes.body, latency_ms: modRes.latency_ms });
+  db.updateResponse(reqId, {
+    status:     modRes.status,
+    headers:    modRes.headers,
+    body:       modRes.body,
+    latency_ms: modRes.latency_ms,
+  });
 
   stats.bytesOut += bodyBuf.length;
   stats.bytesIn  += modBuf.length;
 
-  // Passive scan
   try {
     const full = db.getById(reqId);
     const hits = scanner.scan(full);
@@ -465,7 +519,13 @@ const server = http.createServer(async (clientReq, clientRes) => {
     }
   } catch (_) {}
 
-  bridge.emitResponse({ id:reqId, res_status:modRes.status, res_headers:modRes.headers, res_body:modRes.body, latency_ms:modRes.latency_ms });
+  bridge.emitResponse({
+    id:          reqId,
+    res_status:  modRes.status,
+    res_headers: modRes.headers,
+    res_body:    modRes.body,
+    latency_ms:  modRes.latency_ms,
+  });
   bridge.emitStats(stats);
 });
 
@@ -476,8 +536,7 @@ server.on('connect', (req, socket, head) => {
   mitm.handleConnect(socket, hostname, parseInt(portStr, 10));
 });
 
-// FIX-R2: Set error handler once per connection, not once per request.
-// Prevents MaxListenersExceededWarning from accumulating handlers.
+// Set error handler once per connection — prevents MaxListeners warning
 server.on('connection', socket => {
   socket.setMaxListeners(20);
   socket.on('error', () => {});
@@ -523,4 +582,8 @@ server.on('error', e => {
   process.exit(1);
 });
 
-process.on('SIGINT', () => { console.log('\n[Proxy] Shutting down.'); db.close(); process.exit(0); });
+process.on('SIGINT', () => {
+  console.log('\n[Proxy] Shutting down.');
+  db.close();
+  process.exit(0);
+});
