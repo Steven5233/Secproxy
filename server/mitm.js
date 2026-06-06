@@ -2,7 +2,6 @@
    server/mitm.js — HTTPS MITM engine
    Séç Proxy v2.0
 
-
    ============================================================ */
 'use strict';
 
