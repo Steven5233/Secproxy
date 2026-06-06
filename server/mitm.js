@@ -2,21 +2,7 @@
    server/mitm.js — HTTPS MITM engine
    Séç Proxy v2.0
 
-   Fixes applied:
-   FIX Bug 10: isComplete() now handles chunked transfer-encoding
-               by reading chunked framing to detect the terminal
-               "0\r\n\r\n" chunk instead of assuming headers-only.
-   FIX Bug 11: Match-replace on responses is applied to the
-               accumulated buffer BEFORE streaming to the browser,
-               so modifications actually reach the client.
-   FIX Bug 12: parseResBuf guards sep === -1 correctly so no
-               silent body corruption occurs.
-   FIX Bug 13: Request is forwarded as a Buffer (not a string)
-               so binary bodies (uploads, multipart) are not corrupted.
-   FIX Bug 14: transparentTunnel is the correct fallback; it is
-               only reached before any TLS handshake attempt, so
-               the "200 Connection Established" + raw TCP tunnel
-               remains valid for non-HTTPS CONNECT targets.
+   
    ============================================================ */
 'use strict';
 
@@ -30,13 +16,28 @@ const scanner   = require('./scanner');
 
 const SOCKET_TIMEOUT = 30000; // 30s
 
+// HTTP status reason phrases (common subset)
+const STATUS_PHRASES = {
+  100:'Continue', 101:'Switching Protocols',
+  200:'OK', 201:'Created', 202:'Accepted', 204:'No Content',
+  206:'Partial Content',
+  301:'Moved Permanently', 302:'Found', 303:'See Other',
+  304:'Not Modified', 307:'Temporary Redirect', 308:'Permanent Redirect',
+  400:'Bad Request', 401:'Unauthorized', 403:'Forbidden', 404:'Not Found',
+  405:'Method Not Allowed', 408:'Request Timeout', 409:'Conflict',
+  410:'Gone', 413:'Payload Too Large', 422:'Unprocessable Entity',
+  429:'Too Many Requests',
+  500:'Internal Server Error', 502:'Bad Gateway', 503:'Service Unavailable',
+  504:'Gateway Timeout',
+};
+function reasonPhrase(status) {
+  return STATUS_PHRASES[status] || 'Unknown';
+}
+
 // ── Parse raw HTTP request buffer ───────────────────────────
 function parseReqBuf(buf, scheme, host, port) {
-  // FIX Bug 12/13: Use binary encoding throughout so binary bodies
-  // are preserved exactly. Body is kept as a Buffer slice.
-  const raw  = buf.toString('binary');
-  const sep  = raw.indexOf('\r\n\r\n');
-  // FIX Bug 12: Guard against missing header/body separator.
+  const raw     = buf.toString('binary');
+  const sep     = raw.indexOf('\r\n\r\n');
   const headRaw = sep >= 0 ? raw.slice(0, sep) : raw;
   const lines   = headRaw.split('\r\n');
   const parts   = (lines[0] || '').split(' ');
@@ -48,80 +49,189 @@ function parseReqBuf(buf, scheme, host, port) {
     if (c < 0) continue;
     headers[lines[i].slice(0, c).trim().toLowerCase()] = lines[i].slice(c + 1).trim();
   }
-  // Keep body as Buffer for binary safety (FIX Bug 13)
   const bodyBuf = sep >= 0 ? buf.slice(sep + 4) : Buffer.alloc(0);
   return {
     method, path: rawPath, headers,
-    bodyBuf,                           // raw Buffer — used when forwarding
-    body: bodyBuf.toString('utf8'),    // string — stored in DB
+    bodyBuf,
+    body: bodyBuf.toString('utf8'),
     scheme, host, port,
     url: `${scheme}://${host}${rawPath}`,
   };
 }
 
 // ── Parse raw HTTP response buffer ──────────────────────────
+// FIX-R1: We parse the raw bytes from the origin ourselves so we
+// never feed a Content-Length + Transfer-Encoding response into
+// Node's http parser (which rejects it). We handle the conflict here.
 function parseResBuf(buf) {
-  const raw   = buf.toString('binary');
-  const sep   = raw.indexOf('\r\n\r\n');
-  // FIX Bug 12: Guard sep === -1. If we never got headers, treat the
-  // whole buffer as an opaque body with status 0.
+  const raw = buf.toString('binary');
+  const sep = raw.indexOf('\r\n\r\n');
   if (sep < 0) {
-    return { status: 0, headers: {}, body: buf.toString('utf8'), buf };
+    return { status: 0, statusText: 'Unknown', headers: {}, body: buf.toString('utf8'), bodyBuf: buf };
   }
   const head  = raw.slice(0, sep);
   const lines = head.split('\r\n');
-  const m     = (lines[0] || '').match(/HTTP\/[\d.]+ (\d+)/);
-  const status = m ? parseInt(m[1], 10) : 0;
-  const headers = {};
+  const m     = (lines[0] || '').match(/HTTP\/[\d.]+ (\d+)(?:\s+(.*))?/);
+  const status     = m ? parseInt(m[1], 10) : 0;
+  const statusText = (m && m[2]) ? m[2].trim() : reasonPhrase(status);
+  const headers    = {};
   for (let i = 1; i < lines.length; i++) {
     const c = lines[i].indexOf(':');
     if (c < 0) continue;
-    headers[lines[i].slice(0, c).trim().toLowerCase()] = lines[i].slice(c + 1).trim();
+    const key = lines[i].slice(0, c).trim().toLowerCase();
+    const val = lines[i].slice(c + 1).trim();
+    // Collect duplicate headers (e.g. set-cookie) as arrays
+    if (headers[key] !== undefined) {
+      if (Array.isArray(headers[key])) headers[key].push(val);
+      else headers[key] = [headers[key], val];
+    } else {
+      headers[key] = val;
+    }
   }
-  const bodyBuf = buf.slice(sep + 4);
-  let bodyStr = '';
-  try { bodyStr = bodyBuf.toString('utf8'); } catch (_) { bodyStr = ''; }
-  return { status, headers, body: bodyStr, buf: bodyBuf };
+
+  const isChunked = (headers['transfer-encoding'] || '').toLowerCase().includes('chunked');
+  let bodyBuf;
+  if (isChunked) {
+    bodyBuf = decodeChunked(buf.slice(sep + 4));
+  } else {
+    bodyBuf = buf.slice(sep + 4);
+  }
+
+  let body = '';
+  try { body = bodyBuf.toString('utf8'); } catch (_) {}
+
+  return { status, statusText, headers, body, bodyBuf };
 }
 
-// ── Get Content-Length from headers ─────────────────────────
-function getContentLength(headers) {
-  const cl = headers['content-length'];
-  return cl !== undefined ? parseInt(cl, 10) : -1;
+// ── Decode chunked transfer-encoded body into a plain Buffer ─
+function decodeChunked(buf) {
+  const parts = [];
+  let pos = 0;
+  const raw = buf.toString('binary');
+  while (pos < raw.length) {
+    const nl = raw.indexOf('\r\n', pos);
+    if (nl < 0) break;
+    const sizeLine = raw.slice(pos, nl).split(';')[0].trim(); // ignore chunk extensions
+    const size = parseInt(sizeLine, 16);
+    if (isNaN(size) || size === 0) break;
+    const start = nl + 2;
+    const end   = start + size;
+    parts.push(buf.slice(start, end));
+    pos = end + 2; // skip trailing \r\n after chunk data
+  }
+  return parts.length ? Buffer.concat(parts) : buf; // fallback: return as-is
 }
 
-// ── FIX Bug 10: Check if we have a complete HTTP message ─────
-// Handles: Content-Length, chunked transfer-encoding, and
-// responses/requests with no body (header-only).
+// ── Check if we have a complete HTTP request ─────────────────
 function isComplete(buf) {
   const raw = buf.toString('binary');
   const sep = raw.indexOf('\r\n\r\n');
-  if (sep < 0) return false; // headers not yet fully received
+  if (sep < 0) return false;
 
-  const head = raw.slice(0, sep);
+  const head    = raw.slice(0, sep);
   const bodyRaw = raw.slice(sep + 4);
 
-  // Check Content-Length
   const clMatch = head.match(/content-length:\s*(\d+)/i);
   if (clMatch) {
-    const cl = parseInt(clMatch[1], 10);
-    return bodyRaw.length >= cl;
+    return bodyRaw.length >= parseInt(clMatch[1], 10);
   }
-
-  // FIX Bug 10: Check for chunked transfer-encoding.
-  // A chunked body is complete when we see the terminal "0\r\n\r\n".
-  const teMatch = head.match(/transfer-encoding:\s*chunked/i);
-  if (teMatch) {
-    return bodyRaw.includes('0\r\n\r\n') || bodyRaw.endsWith('0\r\n\r\n');
+  if (/transfer-encoding:\s*chunked/i.test(head)) {
+    return bodyRaw.includes('0\r\n\r\n');
   }
-
-  // No body expected (e.g. HEAD, 204, 304) — headers alone are enough.
   return true;
+}
+
+// ── Forward request over a raw TLS socket ───────────────────
+// FIX-R1: We use a raw tls.connect() and accumulate raw bytes rather
+// than http.request(), so the response is never fed into Node's strict
+// HTTP parser. This handles the Content-Length + Transfer-Encoding
+// conflict that many real-world servers emit.
+function forwardRaw(finalReq, hostname, port) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+
+    // Build request buffer
+    // Strip hop-by-hop headers that must not be forwarded
+    const fwdHeaders = { ...finalReq.headers };
+    delete fwdHeaders['proxy-connection'];
+    delete fwdHeaders['proxy-authorization'];
+    delete fwdHeaders['te'];
+    delete fwdHeaders['trailers'];
+    delete fwdHeaders['upgrade'];
+    // Ensure host is set
+    fwdHeaders['host'] = fwdHeaders['host'] || hostname;
+    // Ensure connection: close so the server doesn't keep the socket open
+    fwdHeaders['connection'] = 'close';
+
+    const hlines      = Object.entries(fwdHeaders).map(([k, v]) => `${k}: ${v}`).join('\r\n');
+    const requestLine = `${finalReq.method} ${finalReq.path} HTTP/1.1`;
+    const headerBlock = Buffer.from(`${requestLine}\r\n${hlines}\r\n\r\n`, 'utf8');
+    const bodyBuf     = finalReq.bodyBuf instanceof Buffer
+      ? finalReq.bodyBuf
+      : Buffer.from(finalReq.body || '', 'utf8');
+    const rawReqBuf   = Buffer.concat([headerBlock, bodyBuf]);
+
+    // FIX-R2: Create a fresh socket per request. This avoids the
+    // MaxListeners warning from accumulating listeners on a reused socket.
+    const origin = tls.connect({
+      host:               hostname,
+      port,
+      servername:         hostname,
+      rejectUnauthorized: false,
+    });
+
+    // FIX-R2: Set a generous but finite max listeners count
+    origin.setMaxListeners(20);
+    origin.setTimeout(SOCKET_TIMEOUT);
+
+    const resBufs = [];
+    let settled   = false;
+
+    function settle(result) {
+      if (settled) return;
+      settled = true;
+      origin.destroy();
+      resolve({ ...result, latency_ms: Date.now() - t0 });
+    }
+
+    origin.once('timeout', () => {
+      settle({ status: 504, statusText: 'Gateway Timeout', headers: {}, body: 'MITM: origin timeout', bodyBuf: Buffer.alloc(0) });
+    });
+
+    origin.once('error', (e) => {
+      settle({ status: 502, statusText: 'Bad Gateway', headers: {}, body: `MITM: ${e.message}`, bodyBuf: Buffer.alloc(0) });
+    });
+
+    origin.once('secureConnect', () => {
+      try { origin.write(rawReqBuf); } catch (_) {}
+    });
+
+    origin.on('data', (chunk) => {
+      resBufs.push(chunk);
+    });
+
+    origin.once('end', () => {
+      const rawResBuf = Buffer.concat(resBufs);
+      let resObj = { status: 0, statusText: 'Unknown', headers: {}, body: '', bodyBuf: Buffer.alloc(0) };
+      try { resObj = parseResBuf(rawResBuf); } catch (_) {}
+      settle(resObj);
+    });
+
+    origin.once('close', () => {
+      if (!settled && resBufs.length) {
+        const rawResBuf = Buffer.concat(resBufs);
+        let resObj = { status: 0, statusText: 'Unknown', headers: {}, body: '', bodyBuf: Buffer.alloc(0) };
+        try { resObj = parseResBuf(rawResBuf); } catch (_) {}
+        settle(resObj);
+      } else if (!settled) {
+        settle({ status: 502, statusText: 'Bad Gateway', headers: {}, body: 'MITM: connection closed', bodyBuf: Buffer.alloc(0) });
+      }
+    });
+  });
 }
 
 // ── Main CONNECT handler ─────────────────────────────────────
 function handleConnect(clientSocket, hostname, port) {
-  // Step 1: ACK the CONNECT
   try {
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
   } catch (e) {
@@ -129,8 +239,6 @@ function handleConnect(clientSocket, hostname, port) {
     return;
   }
 
-  // Step 2: generate spoofed cert and wrap in TLS.
-  // FIX Bug 19: getCertForHost is now async — use .then() so we don't block.
   ca.getCertForHost(hostname).then(mitmCreds => {
     _startTLS(clientSocket, hostname, port, mitmCreds);
   }).catch(e => {
@@ -139,14 +247,14 @@ function handleConnect(clientSocket, hostname, port) {
   });
 }
 
-// ── Internal: start TLS wrapping after cert is ready ─────────
+// ── Start TLS wrapping after cert is ready ───────────────────
 function _startTLS(clientSocket, hostname, port, mitmCreds) {
   let tlsClient;
   try {
     tlsClient = new tls.TLSSocket(clientSocket, {
-      isServer:  true,
-      key:       mitmCreds.key,
-      cert:      mitmCreds.cert,
+      isServer:    true,
+      key:         mitmCreds.key,
+      cert:        mitmCreds.cert,
       requestCert: false,
     });
   } catch (e) {
@@ -155,23 +263,22 @@ function _startTLS(clientSocket, hostname, port, mitmCreds) {
     return;
   }
 
+  // FIX-R2: Set high max listeners on the client socket to prevent
+  // MaxListenersExceededWarning on keep-alive connections.
+  tlsClient.setMaxListeners(50);
   tlsClient.setTimeout(SOCKET_TIMEOUT);
-  tlsClient.on('timeout', () => tlsClient.destroy());
-  tlsClient.on('error',   () => tlsClient.destroy());
+  tlsClient.once('timeout', () => tlsClient.destroy());
+  tlsClient.on('error', () => { try { tlsClient.destroy(); } catch (_) {} });
 
-  // Accumulate request data
   let reqBuf = Buffer.alloc(0);
 
   tlsClient.on('data', (chunk) => {
     reqBuf = Buffer.concat([reqBuf, chunk]);
-
-    // Wait until we have a complete HTTP message
     if (!isComplete(reqBuf)) return;
 
-    const reqBufSnapshot = reqBuf;
-    reqBuf = Buffer.alloc(0); // reset for next request (keep-alive)
-
-    processRequest(reqBufSnapshot, hostname, port, tlsClient);
+    const snapshot = reqBuf;
+    reqBuf = Buffer.alloc(0);
+    processRequest(snapshot, hostname, port, tlsClient);
   });
 
   tlsClient.on('end',   () => {});
@@ -188,13 +295,10 @@ function processRequest(reqBuf, hostname, port, tlsClient) {
     return;
   }
 
-  // Apply match-replace rules
   const modReq = intercept.applyMR(reqObj, 'request');
 
-  // Intercept pause (if enabled)
-  intercept.pause(modReq).then(({ action, request: finalReq }) => {
+  intercept.pause(modReq).then(async ({ action, request: finalReq }) => {
     if (action === 'drop') {
-      // Close connection cleanly on drop
       try { tlsClient.end(); } catch (_) {}
       return;
     }
@@ -204,110 +308,56 @@ function processRequest(reqBuf, hostname, port, tlsClient) {
       reqId = db.insertRequest(finalReq);
     } catch (e) {
       console.error(`[MITM] DB insert error: ${e.message}`);
-      return;
     }
 
-    bridge.emitRequest({
-      id: reqId, ...finalReq,
-      req_headers: finalReq.headers,
-      req_body:    finalReq.body,
-    });
+    if (reqId != null) {
+      bridge.emitRequest({ id: reqId, ...finalReq, req_headers: finalReq.headers, req_body: finalReq.body });
+    }
 
-    // Step 3: open real TLS connection to origin
-    const t0     = Date.now();
-    const origin = tls.connect({
-      host:               hostname,
-      port,
-      servername:         hostname,
-      rejectUnauthorized: false,
-    });
+    // FIX-R1: Use raw socket forward — bypasses Node's http parser
+    // so Content-Length + Transfer-Encoding conflicts don't throw.
+    const resObj = await forwardRaw(finalReq, hostname, port);
 
-    origin.setTimeout(SOCKET_TIMEOUT);
-    origin.on('timeout', () => {
-      console.error(`[MITM] Origin timeout ${hostname}`);
-      origin.destroy();
-      tlsClient.destroy();
-    });
+    // Apply match-replace on response BEFORE sending to browser (Bug 11)
+    const modRes    = intercept.applyMR(resObj, 'response');
+    const modBodyBuf = modRes.bodyBuf instanceof Buffer && modRes.body === resObj.body
+      ? modRes.bodyBuf
+      : Buffer.from(modRes.body || '', 'utf8');
 
-    origin.on('error', (e) => {
-      if (!['ECONNRESET', 'EPIPE', 'ECONNREFUSED'].includes(e.code)) {
-        console.error(`[MITM] Origin error ${hostname}: ${e.message}`);
-      }
-      try { tlsClient.destroy(); } catch (_) {}
-    });
+    // FIX-R1: Strip conflicting headers; set definitive content-length.
+    const respHeaders = { ...modRes.headers };
+    delete respHeaders['transfer-encoding'];  // we already decoded chunks
+    delete respHeaders['content-encoding'];   // body is already decompressed by origin if any
+    respHeaders['content-length'] = String(modBodyBuf.length);
 
-    origin.on('connect', () => {
-      // FIX Bug 13: Build request as a Buffer to preserve binary bodies.
-      // Reconstruct header lines from finalReq.headers.
-      const hlines = Object.entries(finalReq.headers)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join('\r\n');
-      const requestLine = `${finalReq.method} ${finalReq.path} HTTP/1.1`;
-      const headerBlock = Buffer.from(`${requestLine}\r\n${hlines}\r\n\r\n`, 'utf8');
+    // FIX-R3: Use correct status code and real reason phrase (was hardcoded 'OK')
+    const finalStatus = modRes.status || resObj.status || 502;
+    const statusLine  = `HTTP/1.1 ${finalStatus} ${modRes.statusText || reasonPhrase(finalStatus)}`;
 
-      // Use the raw bodyBuf if available (preserved from parseReqBuf).
-      // Fall back to encoding the string body for compatibility with
-      // requests that came through intercept.applyMR (which operates on strings).
-      const bodyBuf = finalReq.bodyBuf instanceof Buffer
-        ? finalReq.bodyBuf
-        : Buffer.from(finalReq.body || '', 'utf8');
+    // Serialize headers — expand arrays (e.g. multiple set-cookie)
+    const headerLines = [];
+    for (const [k, v] of Object.entries(respHeaders)) {
+      if (Array.isArray(v)) v.forEach(vv => headerLines.push(`${k}: ${vv}`));
+      else headerLines.push(`${k}: ${v}`);
+    }
 
-      const rawReqBuf = Buffer.concat([headerBlock, bodyBuf]);
-      try { origin.write(rawReqBuf); } catch (_) {}
-    });
+    const headerBlock = Buffer.from(`${statusLine}\r\n${headerLines.join('\r\n')}\r\n\r\n`, 'utf8');
+    const fullResBuf  = Buffer.concat([headerBlock, modBodyBuf]);
 
-    // FIX Bug 11: Accumulate the full response before sending to client
-    // so that match-replace can modify the response body.
-    let resBufs = [];
-    origin.on('data', (chunk) => {
-      resBufs.push(chunk);
-    });
+    try { tlsClient.write(fullResBuf); } catch (_) {}
 
-    origin.on('end', () => {
-      const latency = Date.now() - t0;
-      const rawResBuf = Buffer.concat(resBufs);
-
-      let resObj = { status: 0, headers: {}, body: '', buf: Buffer.alloc(0) };
-      try { resObj = parseResBuf(rawResBuf); } catch (_) {}
-
-      // FIX Bug 11: Apply match-replace BEFORE sending to browser.
-      const modRes = intercept.applyMR(resObj, 'response');
-
-      // Rebuild the response buffer with the (potentially modified) body.
-      const modBodyBuf = modRes.buf && modRes.body === resObj.body
-        ? modRes.buf
-        : Buffer.from(modRes.body || '', 'utf8');
-
-      // Rebuild the full HTTP response (header block + body) so the browser
-      // receives a correctly framed response with the modified body.
-      const respHeaders = { ...modRes.headers };
-      // Ensure content-length reflects the modified body length.
-      respHeaders['content-length'] = String(modBodyBuf.length);
-      // Remove transfer-encoding since we're sending a complete response.
-      delete respHeaders['transfer-encoding'];
-
-      const statusLine  = `HTTP/1.1 ${modRes.status || resObj.status} OK`;
-      const headerLines = Object.entries(respHeaders)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join('\r\n');
-      const headerBlock = Buffer.from(`${statusLine}\r\n${headerLines}\r\n\r\n`, 'utf8');
-      const fullResBuf  = Buffer.concat([headerBlock, modBodyBuf]);
-
-      // Now send the complete (potentially modified) response to the browser.
-      try { tlsClient.write(fullResBuf); } catch (_) {}
-
+    if (reqId != null) {
       try {
         db.updateResponse(reqId, {
-          status:     modRes.status || resObj.status,
+          status:     finalStatus,
           headers:    modRes.headers,
           body:       modRes.body,
-          latency_ms: latency,
+          latency_ms: resObj.latency_ms,
         });
       } catch (e) {
         console.error(`[MITM] DB update error: ${e.message}`);
       }
 
-      // Passive scan
       try {
         const full = db.getById(reqId);
         const hits = scanner.scan(full);
@@ -319,18 +369,19 @@ function processRequest(reqBuf, hostname, port, tlsClient) {
 
       bridge.emitResponse({
         id:          reqId,
-        res_status:  modRes.status || resObj.status,
+        res_status:  finalStatus,
         res_headers: modRes.headers,
         res_body:    modRes.body,
-        latency_ms:  latency,
+        latency_ms:  resObj.latency_ms,
       });
+    }
 
+    // Keep-alive: don't close — wait for next request on same TLS socket.
+    // Only close if the server or client signals connection: close.
+    const connHeader = (modRes.headers['connection'] || '').toLowerCase();
+    if (connHeader === 'close') {
       try { tlsClient.end(); } catch (_) {}
-    });
-
-    origin.on('close', () => {
-      try { tlsClient.end(); } catch (_) {}
-    });
+    }
 
   }).catch((e) => {
     console.error(`[MITM] Intercept error: ${e.message}`);
@@ -338,14 +389,15 @@ function processRequest(reqBuf, hostname, port, tlsClient) {
   });
 }
 
-// ── Transparent TCP tunnel fallback (when MITM cert fails) ──
+// ── Transparent TCP tunnel fallback ─────────────────────────
 function transparentTunnel(clientSocket, hostname, port) {
   const tunnel = net.connect(port, hostname, () => {
     clientSocket.pipe(tunnel);
     tunnel.pipe(clientSocket);
   });
-  tunnel.on('error', () => { try { clientSocket.destroy(); } catch(_){} });
-  clientSocket.on('error', () => { try { tunnel.destroy(); } catch(_){} });
+  tunnel.setMaxListeners(20);
+  tunnel.on('error',        () => { try { clientSocket.destroy(); } catch (_) {} });
+  clientSocket.on('error',  () => { try { tunnel.destroy();       } catch (_) {} });
 }
 
 module.exports = { handleConnect };
