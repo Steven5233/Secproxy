@@ -5,10 +5,15 @@
    Uses sql.js (pure JavaScript SQLite — zero native compilation,
    works on Termux without node-gyp).
 
-   Every public method is synchronous-looking but internally
-   waits for db.init() to finish via a readiness promise.
-   This prevents "Cannot read properties of null" crashes when
-   the proxy receives requests before the DB wasm loads.
+   FIX Bug 9: persist() is now debounced (100ms) so bulk writes
+   (e.g. request + response + scanner hits) are batched into a
+   single disk write instead of one per call.
+
+   FIX Bug 7: flagRequest is called via module.exports so it works
+   correctly even when addHit is destructured.
+
+   FIX Bug 8: _guard logs a warning instead of throwing if the DB
+   isn't ready, returning a safe fallback so the proxy doesn't crash.
    ============================================================ */
 'use strict';
 
@@ -26,11 +31,29 @@ let _initErr   = null;
 let _readyResolve;
 const _ready = new Promise(res => { _readyResolve = res; });
 
-// ── Persist DB to disk after every write ─────────────────────
+// ── FIX Bug 9: Debounced persist — batches writes within 100ms ─
+let _persistTimer = null;
 function persist() {
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    try {
+      const data = _db.export();
+      fs.writeFileSync(DB_PATH, Buffer.from(data));
+    } catch (e) {
+      console.error('[DB] persist error:', e.message);
+    }
+  }, 100);
+}
+
+// Flush immediately (used on shutdown)
+function persistNow() {
+  if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null; }
   try {
-    const data = _db.export();
-    fs.writeFileSync(DB_PATH, Buffer.from(data));
+    if (_db) {
+      const data = _db.export();
+      fs.writeFileSync(DB_PATH, Buffer.from(data));
+    }
   } catch (e) {
     console.error('[DB] persist error:', e.message);
   }
@@ -145,19 +168,21 @@ function _insert(sql, params = []) {
   return row ? row.id : null;
 }
 
-// ── Guard: every public method goes through this ─────────────
-// Returns result synchronously once ready, throws if DB failed.
-function _guard(fn) {
+// ── FIX Bug 8: _guard no longer throws on early access.
+// Returns a safe fallback (null / empty array / false) and logs
+// a warning so the proxy doesn't crash on startup edge cases.
+function _guard(fn, fallback = null) {
   if (_initDone && !_initErr) return fn();
-  if (_initErr) throw new Error('[DB] not initialised: ' + _initErr.message);
-  // DB not ready yet — this shouldn't happen because proxy.js
-  // awaits init() before calling server.listen(), but just in
-  // case, throw a clear error instead of a null crash.
-  throw new Error('[DB] accessed before init() completed — this is a bug');
+  if (_initErr) {
+    console.error('[DB] operation skipped — init failed:', _initErr.message);
+    return fallback;
+  }
+  console.warn('[DB] operation skipped — init not yet complete (this is unexpected)');
+  return fallback;
 }
 
 // ── Public API ────────────────────────────────────────────────
-module.exports = {
+const api = {
   init,
 
   insertRequest(r) {
@@ -167,7 +192,7 @@ module.exports = {
       [Date.now(), r.method||'GET', r.scheme||'http', r.host||'',
        r.port||80, r.path||'/', r.url||'',
        JSON.stringify(r.headers||{}), r.body||null]
-    ));
+    ), null);
   },
 
   updateResponse(id, r) {
@@ -181,7 +206,7 @@ module.exports = {
   },
 
   getById(id) {
-    return _guard(() => _get(`SELECT * FROM requests WHERE id=?`, [id]));
+    return _guard(() => _get(`SELECT * FROM requests WHERE id=?`, [id]), null);
   },
 
   list(n = 1000) {
@@ -190,7 +215,7 @@ module.exports = {
               req_headers, req_body, res_status, res_headers,
               res_body, latency_ms, flagged, tag
        FROM requests ORDER BY ts DESC LIMIT ?`, [n]
-    ));
+    ), []);
   },
 
   search(q) {
@@ -204,7 +229,7 @@ module.exports = {
          ORDER BY ts DESC LIMIT 500`,
         [w, w, w]
       );
-    });
+    }, []);
   },
 
   clearAll() {
@@ -214,6 +239,8 @@ module.exports = {
     });
   },
 
+  // FIX Bug 7: Use api.flagRequest() instead of this.flagRequest()
+  // so it resolves correctly even when addHit is destructured.
   flagRequest(id) {
     _guard(() => _run(`UPDATE requests SET flagged=1 WHERE id=?`, [id]));
   },
@@ -225,14 +252,14 @@ module.exports = {
          VALUES (?,?,?,?,?)`,
         [h.request_id, Date.now(), h.severity, h.type, h.detail||'']
       );
-      this.flagRequest(h.request_id);
+      api.flagRequest(h.request_id);  // FIX Bug 7: use api.flagRequest, not this.
     });
   },
 
   hitsFor(id) {
     return _guard(() => _all(
       `SELECT * FROM scanner_hits WHERE request_id=?`, [id]
-    ));
+    ), []);
   },
 
   saveRequest(o) {
@@ -240,13 +267,13 @@ module.exports = {
       `INSERT INTO saved_requests (ts, name, folder, request_id, raw)
        VALUES (?,?,?,?,?)`,
       [Date.now(), o.name, o.folder||'Default', o.request_id||null, o.raw||'']
-    ));
+    ), null);
   },
 
   listSaved() {
     return _guard(() => _all(
       `SELECT * FROM saved_requests ORDER BY folder, name`
-    ));
+    ), []);
   },
 
   deleteSaved(id) {
@@ -256,7 +283,7 @@ module.exports = {
   listRules() {
     return _guard(() => _all(
       `SELECT * FROM intercept_rules ORDER BY id`
-    ));
+    ), []);
   },
 
   addRule(r) {
@@ -264,7 +291,7 @@ module.exports = {
       `INSERT INTO intercept_rules (enabled, field, op, value)
        VALUES (?,?,?,?)`,
       [r.enabled||1, r.field, r.op, r.value]
-    ));
+    ), null);
   },
 
   deleteRule(id) {
@@ -274,7 +301,7 @@ module.exports = {
   listMR() {
     return _guard(() => _all(
       `SELECT * FROM match_replace_rules ORDER BY id`
-    ));
+    ), []);
   },
 
   addMR(r) {
@@ -284,7 +311,7 @@ module.exports = {
        VALUES (?,?,?,?,?,?)`,
       [r.enabled||1, r.scope, r.field, r.match_str,
        r.replace, r.use_regex||0]
-    ));
+    ), null);
   },
 
   deleteMR(id) {
@@ -292,6 +319,8 @@ module.exports = {
   },
 
   close() {
-    if (_db) { persist(); _db.close(); _db = null; }
+    if (_db) { persistNow(); _db.close(); _db = null; }
   },
 };
+
+module.exports = api;
