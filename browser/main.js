@@ -37,16 +37,24 @@ function startProxyServer() {
       env: { ...process.env, PROXY_PORT, WS_PORT },
       stdio: 'pipe',
     });
+    // FIX Bug 20: stdout chunks are not line-buffered — accumulate into a
+    // growing buffer and search it for the RUNNING marker to avoid missing
+    // it when it spans two chunks.
+    let stdoutBuf = '';
+    let resolved  = false;
     proxyProc.stdout.on('data', d => {
-      const line = d.toString();
-      process.stdout.write('[proxy] ' + line);
-      if (line.includes('RUNNING')) resolve();
+      stdoutBuf += d.toString();
+      process.stdout.write('[proxy] ' + d);
+      if (!resolved && stdoutBuf.includes('RUNNING')) {
+        resolved = true;
+        resolve();
+      }
     });
     proxyProc.stderr.on('data', d => process.stderr.write('[proxy-err] ' + d));
     proxyProc.on('exit', code => { if (code) console.error(`[proxy] exited with code ${code}`); });
 
-    // Fallback resolve after 4 seconds if stdout message missed
-    setTimeout(resolve, 4000);
+    // Fallback resolve after 6 seconds if the RUNNING marker never appears.
+    setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, 6000);
   });
 }
 
@@ -121,11 +129,19 @@ function createBrowser() {
       browserWin.loadURL('https://example.com');
     });
 
-  // ── Install CA cert so HTTPS works without warnings ───────
-  const caPath = path.join(__dirname, '..', 'server', 'ca', 'secproxy-ca.crt');
+  // ── FIX Bug 21: Scope TLS bypass to only connections going through
+  // the proxy (i.e. not the UI server at 127.0.0.1 or localhost).
+  // We trust proxy-intercepted certs because we generated them; we
+  // still verify the UI server connection normally.
   ses.setCertificateVerifyProc((request, callback) => {
-    // Trust everything — we're the MITM
-    callback(0);
+    const host = request.hostname || '';
+    // Trust any cert that came through our MITM proxy (non-loopback hosts).
+    // Loopback connections (UI server, localhost) use the system verifier (callback(-3)).
+    if (host === '127.0.0.1' || host === 'localhost') {
+      callback(-3); // use Chromium's default verification
+    } else {
+      callback(0);  // trust — our MITM cert
+    }
   });
 
   // ── Address bar / navigation menu ─────────────────────────
