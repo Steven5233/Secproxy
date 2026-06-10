@@ -2,22 +2,6 @@
    server/proxy.js — Main proxy server + REST API
    Séç Proxy v2.0
 
-   Ports:
-     PROXY_PORT (default 8080) — HTTP forward proxy + REST API
-     WS_PORT    (default 8081) — WebSocket bridge to UI
-
-   All previous fixes retained. Additional runtime fixes:
-   FIX-R4: Garbled/binary response in browser — compressed bodies
-            (gzip, deflate, brotli) were not being decompressed in
-            the 'close' path of forwardRaw(). Many servers close the
-            TCP connection without a FIN so only 'close' fires, never
-            'end'. Unified both paths into a single async processRaw()
-            function that always decompresses regardless of which
-            socket event triggers settlement.
-   FIX-R5: Also tell the origin we accept all encodings by forwarding
-            'accept-encoding' but handle the decompression ourselves,
-            so we don't accidentally request no-encoding when the
-            browser sent its own accept-encoding.
    ============================================================ */
 'use strict';
 
@@ -34,6 +18,7 @@ const intercept = require('./intercept');
 const mitm      = require('./mitm');
 const scanner   = require('./scanner');
 const ca        = require('./ca');
+const netsetup  = require('./netsetup');
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
 const WS_PORT    = parseInt(process.env.WS_PORT    || '8081', 10);
@@ -553,14 +538,16 @@ intercept.on('dropped',   ({ id })          => bridge.emitInterceptDone(id, 'dro
 
 // ── Start ─────────────────────────────────────────────────────
 db.init().then(() => ca.caInitPromise).then(() => {
-  server.listen(PROXY_PORT, '0.0.0.0', () => {
+  const BIND_IP = netsetup.setup();
+  server.listen(PROXY_PORT, BIND_IP, () => {
     bridge.start(WS_PORT);
     const lanIP = getLanIP();
     console.log('');
     console.log('╔══════════════════════════════════════════════╗');
     console.log('║          Séç Proxy v2.0 — RUNNING           ║');
     console.log('╠══════════════════════════════════════════════╣');
-    console.log(`║  Proxy   →  0.0.0.0:${PROXY_PORT}  (${lanIP})`);
+    console.log(`║  Proxy   →  ${BIND_IP}:${PROXY_PORT}`);
+    console.log(`║  Alias   →  ${netsetup.aliasIP}:${PROXY_PORT} (set in Drony)`);
     console.log(`║  WS      →  ws://0.0.0.0:${WS_PORT}`);
     console.log(`║  API     →  http://127.0.0.1:${PROXY_PORT}/api`);
     console.log('╠══════════════════════════════════════════════╣');
@@ -583,7 +570,9 @@ server.on('error', e => {
 });
 
 process.on('SIGINT', () => {
-  console.log('\n[Proxy] Shutting down.');
+  console.log('
+[Proxy] Shutting down.');
+  netsetup.teardown();
   db.close();
   process.exit(0);
 });
