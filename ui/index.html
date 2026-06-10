@@ -250,7 +250,7 @@
         <div class="info-row"><span>Proxy port</span><code id="sPort">8080</code></div>
         <div class="info-row"><span>WebSocket</span><code id="sWS">8081</code></div>
       </div>
-      <a class="dl-btn" href="/api/ca.crt" download>⬇ Download CA Cert (secproxy-ca.crt)</a>
+      <button class="dl-btn" onclick="downloadCert()">⬇ Download CA Cert (secproxy-ca.crt)</button>
       <p class="hint">Android: Settings → Security → Install certificate → select file<br>
       Then restart browser and set Wi-Fi proxy to the host IP above.</p>
     </div>
@@ -384,5 +384,20 @@
 </div>
 
 <script src="app.js"></script>
+<script>
+async function downloadCert() {
+  try {
+    const res = await fetch("http://127.0.0.1:8080/api/ca.crt");
+    if (!res.ok) { alert("Cert not ready yet — wait a few seconds and try again"); return; }
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = "secproxy-ca.crt";
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e) { alert("Download failed: " + e.message); }
+}
+</script>
 </body>
 </html>
